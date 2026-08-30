@@ -1389,46 +1389,39 @@ git commit -m "feat(claude-code): add --auto-resume to sleep-and-continue past a
 
 - [ ] **Step 1: Write the failing test**
 
+The enclosing function for the `run_strix_scan(...)` call at `strix/interface/cli.py:193` is `async def run_cli(args: Any) -> None` (`strix/interface/cli.py:41`). Calling it directly would require mocking Docker/session/Live-status machinery unrelated to this one-line forwarding change, so this test instead asserts the source text of the call site carries `auto_resume=` — a source-inspection test, appropriate for a single-line glue change:
+
 ```python
 # tests/test_cli_auto_resume.py
 """Test that the CLI entry point forwards --auto-resume to run_strix_scan."""
 
 from __future__ import annotations
 
-from unittest import mock
+import ast
+import inspect
 
-import pytest
+from strix.interface import cli
 
 
-@pytest.mark.asyncio
-async def test_cli_forwards_auto_resume_flag() -> None:
-    from strix.interface import cli
-
-    args = mock.MagicMock()
-    args.auto_resume = True
-    args.run_name = "scan-test"
-    args.local_sources = []
-    args.workspace_files = None
-    args.interactive = False
-    args.max_budget_usd = None
-    args.max_turns = 25
-
-    with mock.patch("strix.interface.cli.run_strix_scan", new=mock.AsyncMock()) as run_mock:
-        # call whichever function in strix/interface/cli.py wraps the
-        # try/Live block shown around line 193 — name TBD by the
-        # implementer reading that file's enclosing function signature.
-        await cli._run_headless_scan(args)  # placeholder name; see Step 2
-
-    _, called_kwargs = run_mock.call_args
-    assert called_kwargs.get("auto_resume") is True
+def test_run_cli_forwards_auto_resume_to_run_strix_scan() -> None:
+    source = inspect.getsource(cli.run_cli)
+    tree = ast.parse(source)
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "run_strix_scan"
+    ]
+    assert calls, "run_cli no longer calls run_strix_scan(...) directly"
+    keyword_names = {kw.arg for kw in calls[0].keywords}
+    assert "auto_resume" in keyword_names
 ```
-
-Note for the implementer: `cli._run_headless_scan` is a placeholder — open `strix/interface/cli.py` and use the actual enclosing function name for the block shown around line 193 (the one containing `await run_strix_scan(scan_config=scan_config, scan_id=args.run_name, ...)`). Fix the test's call to match before running it.
 
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `uv run pytest tests/test_cli_auto_resume.py -v`
-Expected: FAIL, either on the placeholder name (fix per the note above) or on the missing `auto_resume` kwarg.
+Expected: FAIL — `assert "auto_resume" in keyword_names` fails (the call has no `auto_resume` keyword yet).
 
 - [ ] **Step 3: Forward the flag**
 
