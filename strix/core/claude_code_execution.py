@@ -25,6 +25,15 @@ Native tool scoping (what is actually enforced):
   the layer that still applies where the OS sandbox does not.
 - ``WebSearch`` is unaffected by the network denial: it is served by Anthropic's
   API backend, not by a host network call from a sandboxed command.
+- The session is isolated from the operator's own Claude Code configuration
+  (``setting_sources=[]``, ``strict_mcp_config=True``): their hooks, permission
+  rules and MCP servers must not follow a scan agent into a run.
+
+Verified against the real CLI (0.2.148 on Windows): the session starts with only
+``Read``/``Write``/``WebSearch`` plus the bridged ``mcp__strix__*`` tools, with
+the ``strix`` MCP server as the only connection and ``cwd`` on the scratch
+directory. The CLI reports the bash sandbox as unavailable on Windows, which is
+why ``Bash`` is not offered there at all.
 
 Parity with the default engine: lifecycle recovery (a turn that ends without
 ``finish_scan``/``agent_finish``/``respond_to_user``/``wait_for_agents`` is
@@ -125,7 +134,23 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _MCP_SERVER_NAME = "strix"
+_MCP_TOOL_PREFIX = f"mcp__{_MCP_SERVER_NAME}__"
 _SCRATCH_DIR_NAME = "strix-claude-code-scratch"
+
+# Strix's prompts (and its lifecycle nudge) name tools bare -- `finish_scan`,
+# `exec_command`, ... -- but an in-process MCP server can only expose them as
+# `mcp__strix__<tool>`. Without this note the agent calls the name it was told
+# and gets "No such tool available" (observed against the real CLI).
+_TOOL_NAMING_NOTE = f"""
+
+# Tool names on this engine
+
+Every Strix tool reaches you through an in-process MCP server, so its real name
+is `{_MCP_TOOL_PREFIX}<tool>` -- for example `{_MCP_TOOL_PREFIX}finish_scan`,
+`{_MCP_TOOL_PREFIX}exec_command`, `{_MCP_TOOL_PREFIX}create_agent`. Wherever
+these instructions name a tool without that prefix, add it: the unprefixed name
+does not exist and calling it fails.
+"""
 
 # Claude Code's own tools, kept as auxiliary research aids only.
 _NATIVE_TOOLS: tuple[str, ...] = ("Read", "Write", "WebSearch")
@@ -252,9 +277,16 @@ def _build_options(
     native = _native_tools()
     scratch = _scratch_cwd(agent_id)
     return ClaudeAgentOptions(
-        system_prompt=instructions,
+        system_prompt=instructions + _TOOL_NAMING_NOTE,
         model=model_slug,
         mcp_servers={_MCP_SERVER_NAME: server},
+        # Isolation: without these the CLI loads the operator's own
+        # ~/.claude settings -- their hooks, their permission rules (which can
+        # widen what this agent may do) and their MCP servers, which a scan
+        # agent must not be able to reach. Confirmed against the real CLI: an
+        # unisolated session offered this machine's unrelated MCP tools.
+        setting_sources=[],
+        strict_mcp_config=True,
         tools=native,
         allowed_tools=[*bridged_tool_names(tools, server_name=_MCP_SERVER_NAME), *native],
         max_turns=max_turns,
@@ -519,7 +551,7 @@ async def _run_until_lifecycle(
             return settled if isinstance(settled, ClaudeCodeRunResult) else None, turns_used
 
         text = tool_required_message(
-            finish_tool="finish_scan" if cfg.is_root else "agent_finish",
+            finish_tool=_MCP_TOOL_PREFIX + ("finish_scan" if cfg.is_root else "agent_finish"),
             attempt=recoveries,
             limit=recovery_limit,
             interactive=cfg.interactive,

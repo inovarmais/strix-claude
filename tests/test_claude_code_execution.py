@@ -361,7 +361,9 @@ async def test_run_nudges_a_turn_that_ended_without_a_lifecycle_tool_call(
 
     assert len(client.prompts) == 2
     assert "without a lifecycle tool" in client.prompts[1]
-    assert "finish_scan" in client.prompts[1]
+    # Named with the bridge prefix: bare `finish_scan` does not exist on this
+    # engine, and an agent nudged toward it just gets "No such tool available".
+    assert "mcp__strix__finish_scan" in client.prompts[1]
     assert isinstance(result, ClaudeCodeRunResult)
     assert coordinator.statuses["agent-1"] == "completed"
 
@@ -543,6 +545,13 @@ def test_options_sandbox_native_tools_and_path_guard() -> None:
     assert "WebSearch" in options.tools
     assert options.hooks is not None
     assert options.hooks["PreToolUse"][0].matcher == "Read|Write"
+    # Isolation from the operator's own Claude Code config: no settings files,
+    # no MCP servers other than Strix's own in-process one.
+    assert options.setting_sources == []
+    assert options.strict_mcp_config is True
+    # Strix's prompt names tools bare; the bridge exposes them prefixed.
+    assert "mcp__strix__finish_scan" in str(options.system_prompt)
+    assert "be careful" in str(options.system_prompt)
 
     claude_code_execution._clear_scratch_cwd("agent-opts")
 
