@@ -26,6 +26,25 @@ Native tool scoping (what is actually enforced):
 - ``WebSearch`` is unaffected by the network denial: it is served by Anthropic's
   API backend, not by a host network call from a sandboxed command.
 
+Parity with the default engine: lifecycle recovery (a turn that ends without
+``finish_scan``/``agent_finish``/``respond_to_user``/``wait_for_agents`` is
+nudged back into a tool call, bounded by the same recovery limit), interactive
+parking/resuming on messages, mid-turn interruption, the interactive budget
+pause, cost and turn accounting, and the multi-agent graph all behave the same
+way here -- they are driven from the same coordinator and the same helpers in
+``strix.core.execution``.
+
+Known differences, none of which change a scan's outcome:
+
+- Wind-down directives at the turn-budget warn bands are logged rather than
+  injected into the conversation: the CLI owns the turn once a query starts, so
+  there is no equivalent of the default engine's per-LLM-call hook.
+- Context compaction, image budgeting and transient-error turn replay are the
+  CLI's own responsibility on this engine, not Strix's.
+- ``strix --resume`` restores the run's Strix state (agents, findings, queued
+  messages) but starts a fresh CLI conversation; the default engine replays its
+  SDK session instead.
+
 Quota-exceeded detection has two layers:
 
 - Primary: a structured ``RateLimitEvent`` with ``rate_limit_info.status ==
@@ -335,8 +354,18 @@ async def _apply_cost(
     coordinator: AgentCoordinator,
     agent_id: str,
     is_root: bool,
+    interactive: bool,
     max_budget_usd: float | None,
+    budget_hooks: Any = None,
 ) -> None:
+    """Record the turn's cost and enforce the scan budget.
+
+    Mirrors ``strix.core.hooks.ReportUsageHooks`` (which this engine never
+    runs): an interactive scan pauses for the user instead of stopping, and
+    only an autonomous one holds back the sub-agent reserve. The ceiling is
+    read from the hooks object when there is one, so a budget the user extends
+    mid-run is honored here too.
+    """
     cost = getattr(message, "total_cost_usd", None)
     if not isinstance(cost, int | float):
         return
@@ -344,19 +373,28 @@ async def _apply_cost(
     if report_state is None:
         return
     report_state.record_observed_llm_cost(float(cost))
-    if max_budget_usd is None:
+    ceiling = getattr(budget_hooks, "max_budget_usd", None)
+    if ceiling is None:
+        ceiling = max_budget_usd
+    if ceiling is None:
         return
     total = report_state.get_total_llm_cost()
-    if total >= max_budget_usd:
+    if total >= ceiling:
+        if interactive:
+            await coordinator.pause_for_budget(agent_id)
+            raise BudgetPausedError(
+                f"Scan budget of ${ceiling:.2f} reached (spent ${total:.4f}); "
+                "pausing until the user continues"
+            )
         await coordinator.set_status(agent_id, "stopped")
         raise BudgetExceededError(
-            f"Token budget of ${max_budget_usd:.2f} exceeded (spent ${total:.4f})"
+            f"Token budget of ${ceiling:.2f} exceeded (spent ${total:.4f})"
         )
-    reserve_limit = max_budget_usd * _SUBAGENT_BUDGET_RESERVE
-    if not is_root and total >= reserve_limit:
+    reserve_limit = ceiling * _SUBAGENT_BUDGET_RESERVE
+    if not interactive and not is_root and total >= reserve_limit:
         await coordinator.set_status(agent_id, "stopped")
         raise SubagentBudgetReservedError(
-            f"Sub-agent budget reserve reached: spent ${total:.4f} of ${max_budget_usd:.2f}"
+            f"Sub-agent budget reserve reached: spent ${total:.4f} of ${ceiling:.2f}"
         )
 
 
@@ -368,22 +406,32 @@ class _EngineTurn:
     turns_used: int
 
 
+@dataclass(frozen=True)
+class _LoopConfig:
+    """The per-run knobs every turn of one agent's loop needs."""
+
+    agent_id: str
+    is_root: bool
+    interactive: bool
+    max_turns: int
+    max_budget_usd: float | None
+    budget_hooks: Any = None
+    event_sink: Callable[[str, Any], None] | None = None
+
+
 async def _consume_response(
     client: Any,
     *,
     coordinator: AgentCoordinator,
-    agent_id: str,
-    is_root: bool,
-    max_turns: int,
-    max_budget_usd: float | None,
-    event_sink: Callable[[str, Any], None] | None,
+    cfg: _LoopConfig,
     turns_used: int,
 ) -> _EngineTurn:
     final_output: str | None = None
+    agent_id = cfg.agent_id
     async for message in client.receive_response():
-        if event_sink is not None:
+        if cfg.event_sink is not None:
             try:
-                event_sink(agent_id, message)
+                cfg.event_sink(agent_id, message)
             except Exception:
                 logger.exception("stream event sink failed for %s", agent_id)
 
@@ -400,16 +448,18 @@ async def _consume_response(
         turns_used = _log_turn_stage(
             message,
             turns_used=turns_used,
-            max_turns=max_turns,
-            is_root=is_root,
+            max_turns=cfg.max_turns,
+            is_root=cfg.is_root,
             agent_id=agent_id,
         )
         await _apply_cost(
             message,
             coordinator=coordinator,
             agent_id=agent_id,
-            is_root=is_root,
-            max_budget_usd=max_budget_usd,
+            is_root=cfg.is_root,
+            interactive=cfg.interactive,
+            max_budget_usd=cfg.max_budget_usd,
+            budget_hooks=cfg.budget_hooks,
         )
     return _EngineTurn(final_output=final_output, turns_used=turns_used)
 
@@ -419,12 +469,7 @@ async def _run_until_lifecycle(
     *,
     prompt: str,
     coordinator: AgentCoordinator,
-    agent_id: str,
-    is_root: bool,
-    interactive: bool,
-    max_turns: int,
-    max_budget_usd: float | None,
-    event_sink: Callable[[str, Any], None] | None,
+    cfg: _LoopConfig,
     turns_used: int,
 ) -> tuple[ClaudeCodeRunResult | None, int]:
     """Drive the CLI session until an explicit lifecycle tool settles the status.
@@ -434,23 +479,21 @@ async def _run_until_lifecycle(
     ``respond_to_user``/``wait_for_agents`` leaves the agent ``running``, and is
     nudged back into a tool call, bounded by the same recovery limit.
     """
-    recovery_limit = _INTERACTIVE_TOOL_RECOVERY_LIMIT if interactive else max(1, max_turns)
+    agent_id = cfg.agent_id
+    recovery_limit = (
+        _INTERACTIVE_TOOL_RECOVERY_LIMIT if cfg.interactive else max(1, cfg.max_turns)
+    )
     result: ClaudeCodeRunResult | None = None
     text = prompt
 
     while True:
-        await _check_already_stopped(coordinator=coordinator, agent_id=agent_id, is_root=is_root)
+        await _check_already_stopped(
+            coordinator=coordinator, agent_id=agent_id, is_root=cfg.is_root
+        )
         await coordinator.mark_running(agent_id)
         await client.query(text)
         turn = await _consume_response(
-            client,
-            coordinator=coordinator,
-            agent_id=agent_id,
-            is_root=is_root,
-            max_turns=max_turns,
-            max_budget_usd=max_budget_usd,
-            event_sink=event_sink,
-            turns_used=turns_used,
+            client, coordinator=coordinator, cfg=cfg, turns_used=turns_used
         )
         turns_used = turn.turns_used
         result = ClaudeCodeRunResult(final_output=turn.final_output)
@@ -465,21 +508,21 @@ async def _run_until_lifecycle(
             "agent %s ended a Claude Code turn without a lifecycle tool call "
             "(interactive=%s); forcing tool continuation (%d/%d)",
             agent_id,
-            interactive,
+            cfg.interactive,
             recoveries,
             recovery_limit,
         )
         if recoveries >= recovery_limit:
             settled = await _exhausted_recovery(
-                coordinator, agent_id, result, interactive=interactive
+                coordinator, agent_id, result, interactive=cfg.interactive
             )
             return settled if isinstance(settled, ClaudeCodeRunResult) else None, turns_used
 
         text = tool_required_message(
-            finish_tool="finish_scan" if is_root else "agent_finish",
+            finish_tool="finish_scan" if cfg.is_root else "agent_finish",
             attempt=recoveries,
             limit=recovery_limit,
-            interactive=interactive,
+            interactive=cfg.interactive,
         )
 
 
@@ -555,6 +598,7 @@ async def run_claude_code_agent_loop(
     session: Session | None = None,
     start_parked: bool = False,
     event_sink: Callable[[str, Any], None] | None = None,
+    budget_hooks: Any = None,
 ) -> ClaudeCodeRunResult | None:
     """Run one agent's turn loop on the Claude Code engine.
 
@@ -579,6 +623,16 @@ async def run_claude_code_agent_loop(
         context=context,
     )
 
+    cfg = _LoopConfig(
+        agent_id=agent_id,
+        is_root=is_root,
+        interactive=interactive,
+        max_turns=max_turns,
+        max_budget_usd=max_budget_usd,
+        budget_hooks=budget_hooks,
+        event_sink=event_sink,
+    )
+
     result: ClaudeCodeRunResult | None = None
     turns_used = 0
     client = _open_client(options=options)
@@ -590,12 +644,7 @@ async def run_claude_code_agent_loop(
                         client,
                         prompt=initial_input,
                         coordinator=coordinator,
-                        agent_id=agent_id,
-                        is_root=is_root,
-                        interactive=interactive,
-                        max_turns=max_turns,
-                        max_budget_usd=max_budget_usd,
-                        event_sink=event_sink,
+                        cfg=cfg,
                         turns_used=turns_used,
                     )
 
@@ -617,12 +666,7 @@ async def run_claude_code_agent_loop(
                         client,
                         prompt=prompt,
                         coordinator=coordinator,
-                        agent_id=agent_id,
-                        is_root=is_root,
-                        interactive=True,
-                        max_turns=max_turns,
-                        max_budget_usd=max_budget_usd,
-                        event_sink=event_sink,
+                        cfg=cfg,
                         turns_used=turns_used,
                     )
         # Only reachable if the client's __aexit__ swallowed an exception.

@@ -76,6 +76,57 @@ def test_cli_login_status_false_on_not_logged_in_marker() -> None:
     assert logged_in is False
 
 
+_LOGGED_IN_JSON = """{
+  "loggedIn": true,
+  "authMethod": "claude.ai",
+  "apiProvider": "firstParty",
+  "email": "dev@example.com",
+  "orgName": "Example Inc",
+  "subscriptionType": "team"
+}
+"""
+
+_LOGGED_OUT_JSON = """{
+  "loggedIn": false,
+  "authMethod": null,
+  "apiProvider": "firstParty",
+  "analyticsDisabled": false
+}
+"""
+
+
+def _status_run(stdout: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.CompletedProcess(
+        args=["claude", "auth", "status"], returncode=0, stdout=stdout, stderr=""
+    )
+
+
+def test_cli_login_status_reads_logged_in_from_real_json_output() -> None:
+    """``claude auth status`` emits JSON; its ``loggedIn`` field is the answer."""
+    with (
+        mock.patch("shutil.which", return_value="/usr/local/bin/claude"),
+        mock.patch("subprocess.run", return_value=_status_run(_LOGGED_IN_JSON)),
+    ):
+        logged_in, detail = claude_code.cli_login_status()
+    assert logged_in is True
+    assert detail is not None
+    assert "dev@example.com" in detail
+    assert "team" in detail
+    assert "{" not in detail
+
+
+def test_cli_login_status_false_on_real_logged_out_json() -> None:
+    """A logged-out CLI's JSON contains none of the prose "not logged in"
+    markers, so text matching alone reports it as logged in."""
+    with (
+        mock.patch("shutil.which", return_value="/usr/local/bin/claude"),
+        mock.patch("subprocess.run", return_value=_status_run(_LOGGED_OUT_JSON)),
+    ):
+        logged_in, detail = claude_code.cli_login_status()
+    assert logged_in is False
+    assert detail is None
+
+
 def test_cli_login_status_false_on_command_failure() -> None:
     with (
         mock.patch("shutil.which", return_value="/usr/local/bin/claude"),

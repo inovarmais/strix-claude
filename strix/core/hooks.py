@@ -134,6 +134,15 @@ class ReportUsageHooks(RunHooks[dict[str, Any]]):
         self._max_turns = max_turns
         self._interactive = interactive
 
+    @property
+    def max_budget_usd(self) -> float | None:
+        """The scan's current cost ceiling, including interactive extensions.
+
+        Read by the Claude Code engine, which enforces the budget itself
+        (it never runs these hooks) but must honor the same extensions.
+        """
+        return self._max_budget_usd
+
     def extend_budget(self) -> None:
         if self._max_budget_usd is None or self._budget_increment is None:
             return

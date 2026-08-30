@@ -33,7 +33,11 @@ from strix.core.claude_code_execution import (
     run_claude_code_agent_loop,
 )
 from strix.core.execution import run_agent_loop
-from strix.core.hooks import BudgetExceededError, SubagentBudgetReservedError
+from strix.core.hooks import (
+    BudgetExceededError,
+    ReportUsageHooks,
+    SubagentBudgetReservedError,
+)
 
 
 @dataclass
@@ -155,6 +159,10 @@ class _FakeCoordinator:
         self.mailbox.append(message)
         _ = agent_id
         return True
+
+    async def pause_for_budget(self, agent_id: str) -> None:
+        self.statuses[agent_id] = "budget_paused"
+        self.parked.append(agent_id)
 
     async def attach_stream(self, agent_id: str, stream: Any) -> None:
         _ = agent_id
@@ -437,6 +445,59 @@ async def test_interactive_message_interrupts_the_in_flight_turn(
 
     task.cancel()
     await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_interactive_run_pauses_at_the_budget_instead_of_stopping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Interactive parity with ``ReportUsageHooks``: reaching the budget parks
+    the agent for the user to continue, rather than stopping the scan."""
+    coordinator = _coordinator()
+    client = _FakeClient(
+        [_FakeResultMessage(is_error=False, result="{}", total_cost_usd=5.0)],
+        on_turn_end=_settles(coordinator),
+    )
+    _patch_client(monkeypatch, client)
+    report_state = mock.MagicMock()
+    report_state.get_total_llm_cost.return_value = 5.0
+    _patch_report_state(monkeypatch, report_state)
+
+    task = asyncio.create_task(_run(coordinator, max_budget_usd=1.0, interactive=True))
+    await asyncio.sleep(0.05)
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+    assert coordinator.statuses["agent-1"] == "budget_paused"
+
+
+@pytest.mark.asyncio
+async def test_budget_ceiling_follows_an_extension_made_through_the_hooks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The user extending the budget mid-run raises the ceiling on the hooks
+    object; the engine enforces the budget itself and must read it from there."""
+    coordinator = _coordinator()
+    _patch_client(
+        monkeypatch,
+        _FakeClient(
+            [_FakeResultMessage(is_error=False, result="{}", total_cost_usd=5.0)],
+            on_turn_end=_settles(coordinator),
+        ),
+    )
+    report_state = mock.MagicMock()
+    report_state.get_total_llm_cost.return_value = 5.0
+    _patch_report_state(monkeypatch, report_state)
+    hooks = ReportUsageHooks(model="claude-code/sonnet", max_budget_usd=1.0)
+    hooks.extend_budget()
+    hooks.extend_budget()
+    hooks.extend_budget()
+    hooks.extend_budget()
+    hooks.extend_budget()  # ceiling is now $6
+
+    result = await _run(coordinator, max_budget_usd=1.0, budget_hooks=hooks)
+
+    assert isinstance(result, ClaudeCodeRunResult)
 
 
 @pytest.mark.asyncio

@@ -9,11 +9,13 @@ later task), reusing whatever account it is already logged into
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import shutil
 import subprocess
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 
 logger = logging.getLogger(__name__)
@@ -36,12 +38,25 @@ def is_cli_available() -> bool:
     return shutil.which("claude") is not None
 
 
+def _summarize_status(payload: dict[str, Any]) -> str | None:
+    """One human-readable line from ``claude auth status``'s JSON."""
+    labels = (("email", "Account"), ("orgName", "Org"), ("subscriptionType", "Plan"))
+    parts = [
+        f"{label}: {payload[key]}"
+        for key, label in labels
+        if isinstance(payload.get(key), str) and payload[key]
+    ]
+    return " | ".join(parts) or None
+
+
 def cli_login_status() -> tuple[bool, str | None]:
     """Best-effort ``(logged_in, detail)`` for the ``claude`` CLI's own login.
 
-    ``claude auth status`` prints a human-readable report and is documented
-    as not meant to be scripted against its exit code, so this parses stdout
-    for a known "not logged in" marker rather than trusting the return code.
+    ``claude auth status`` prints JSON -- ``{"loggedIn": true, "authMethod":
+    ..., "subscriptionType": ...}`` -- whose ``loggedIn`` field is the
+    authoritative answer; ``detail`` is a one-line summary of the account it
+    reports. A build that prints prose instead falls back to the text markers,
+    which is also why the exit code is not trusted either way.
     """
     if not is_cli_available():
         return False, None
@@ -56,11 +71,20 @@ def cli_login_status() -> tuple[bool, str | None]:
     except (OSError, subprocess.TimeoutExpired):
         logger.debug("claude auth status failed to run", exc_info=True)
         return False, None
-    output = (result.stdout or "") + (result.stderr or "")
+    output = ((result.stdout or "") + (result.stderr or "")).strip()
+
+    try:
+        payload = json.loads(result.stdout or "")
+    except (TypeError, ValueError):
+        payload = None
+    if isinstance(payload, dict) and isinstance(payload.get("loggedIn"), bool):
+        logged_in = bool(payload["loggedIn"])
+        return logged_in, (_summarize_status(payload) if logged_in else None)
+
     lowered = output.lower()
     if any(marker in lowered for marker in _NOT_LOGGED_IN_MARKERS):
-        return False, output.strip() or None
-    return True, output.strip() or None
+        return False, output or None
+    return True, output or None
 
 
 class SubscriptionQuotaExceededError(RuntimeError):

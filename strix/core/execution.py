@@ -279,6 +279,10 @@ async def run_agent_loop(
             session=session,
             start_parked=start_parked,
             event_sink=event_sink,
+            # The engine enforces the budget itself (it never runs these hooks),
+            # but reads the current ceiling from them so a budget the user
+            # extends mid-run is honored on this engine too.
+            budget_hooks=hooks,
         )
         return cast("ClaudeCodeRunResult | None", claude_code_result)
 

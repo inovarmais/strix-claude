@@ -155,6 +155,61 @@ async def test_subscription_quota_exceeded_propagates_out_of_run_once(
 
 
 @pytest.mark.asyncio
+async def test_quota_stop_is_not_logged_as_a_crash_and_keeps_the_stopped_status(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A quota stop is a clean pause: it must not fall through to the generic
+    ``except BaseException`` handler, which logs a crash traceback and
+    overwrites the ``stopped`` status with ``failed``."""
+    _patch_run_once_scaffolding(monkeypatch, tmp_path)
+    reset_at = datetime.now(UTC) + timedelta(seconds=30)
+
+    async def _raise_quota_exceeded(*_args: Any, **_kwargs: Any) -> None:
+        raise SubscriptionQuotaExceededError("5-hour limit reached - resets soon", reset_at)
+
+    monkeypatch.setattr(runner, "run_agent_loop", _raise_quota_exceeded)
+    coordinator = AgentCoordinator()
+
+    with caplog.at_level(logging.INFO), pytest.raises(SubscriptionQuotaExceededError):
+        await runner._run_strix_scan_once(
+            scan_config={"targets": [], "scan_mode": "deep"},
+            scan_id="scan-test",
+            image="img",
+            coordinator=coordinator,
+        )
+
+    assert set(coordinator.statuses.values()) == {"stopped"}
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert "quota exhausted" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_quota_stop_prints_reset_time_and_resume_command(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The user-facing hint names the reset time and goes to the console -- the
+    scan's logging handlers are already torn down by the time it runs."""
+    reset_at = datetime(2026, 8, 30, 19, 30, tzinfo=UTC)
+
+    async def fake_run_once(*_args: object, **_kwargs: object) -> str | None:
+        raise SubscriptionQuotaExceededError("5-hour limit reached", reset_at)
+
+    monkeypatch.setattr(runner, "_run_strix_scan_once", fake_run_once)
+
+    result = await runner.run_strix_scan(
+        scan_config={"targets": []},
+        scan_id="scan-test",
+        image="strix-sandbox:latest",
+        auto_resume=False,
+    )
+
+    out = capsys.readouterr().out
+    assert result is None
+    assert "2026-08-30 19:30 UTC" in out
+    assert "strix --resume scan-test" in out
+
+
+@pytest.mark.asyncio
 async def test_auto_resume_without_scan_id_logs_distinctly_and_returns_none(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:

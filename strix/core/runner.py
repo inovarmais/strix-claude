@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any
 from agents import RunConfig
 from agents.sandbox import SandboxRunConfig
 from openai import RateLimitError
+from rich.console import Console
 
 from strix.agents.factory import build_strix_agent, make_child_factory
 from strix.agents.prompt import render_system_prompt
@@ -629,6 +630,20 @@ async def _run_strix_scan_once(
             with contextlib.suppress(Exception):
                 await coordinator.set_status(root_id, "stopped")
         return None
+    except SubscriptionQuotaExceededError as exc:
+        # A subscription quota stop is a clean pause, not a crash: the engine has
+        # already settled the agent's status. Logged as a stop (not an exception)
+        # and re-raised so run_strix_scan's --auto-resume wrapper still sees it.
+        logger.warning(
+            "Scan %s stopped: Claude Code subscription quota exhausted (%s); resets at %s.",
+            scan_id,
+            exc,
+            exc.reset_at,
+        )
+        if root_id is not None:
+            with contextlib.suppress(Exception):
+                await coordinator.set_status(root_id, "stopped")
+        raise
     except (asyncio.CancelledError, KeyboardInterrupt):
         logger.info("Scan %s interrupted by the user", scan_id)
         if root_id is not None:
@@ -669,6 +684,25 @@ _MAX_AUTO_RESUME_RETRIES = 10
 _MIN_AUTO_RESUME_SLEEP_SECONDS = 5.0
 
 
+def _print_quota_stop(scan_id: str | None, exc: SubscriptionQuotaExceededError) -> None:
+    """Tell the user how to resume, on the console rather than the logger.
+
+    By the time this runs, ``_run_strix_scan_once``'s ``finally`` has already
+    torn the scan's logging down, so a ``logger`` call here would fall through
+    to ``logging.lastResort`` and reach stderr unformatted. Other user-facing
+    status in the CLI (``strix.interface.environment`` / ``auth_cli``) goes to a
+    rich console, so this does too.
+    """
+    console = Console()
+    reset_at = f" It resets at {exc.reset_at:%Y-%m-%d %H:%M UTC}." if exc.reset_at else ""
+    console.print(
+        f"\n[yellow]Scan stopped:[/] the Claude Code subscription's usage limit was "
+        f"reached.{reset_at}"
+    )
+    if scan_id:
+        console.print(f"Resume it with: [cyan]strix --resume {scan_id}[/]")
+
+
 async def run_strix_scan(
     *,
     auto_resume: bool = False,
@@ -691,13 +725,7 @@ async def run_strix_scan(
             return await _run_strix_scan_once(**kwargs)
         except SubscriptionQuotaExceededError as exc:
             if not auto_resume:
-                logger.warning(
-                    "Scan %s stopped: Claude Code subscription quota exhausted (%s). "
-                    "Resume with 'strix --resume %s' once it resets.",
-                    scan_id,
-                    exc,
-                    scan_id,
-                )
+                _print_quota_stop(scan_id, exc)
                 return None
             if scan_id is None:
                 logger.warning(
@@ -711,13 +739,14 @@ async def run_strix_scan(
             if retries >= _MAX_AUTO_RESUME_RETRIES:
                 logger.warning(
                     "Scan %s stopped: Claude Code subscription quota exhausted (%s) "
-                    "again after %d --auto-resume retries. Giving up; resume manually "
-                    "with 'strix --resume %s' once it resets.",
+                    "again after %d --auto-resume retries (reset reported as %s). "
+                    "Giving up.",
                     scan_id,
                     exc,
                     retries,
-                    scan_id,
+                    exc.reset_at,
                 )
+                _print_quota_stop(scan_id, exc)
                 return None
             retries += 1
             wait_seconds = (

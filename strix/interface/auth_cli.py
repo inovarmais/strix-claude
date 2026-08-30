@@ -263,6 +263,8 @@ def _status(console: Console) -> int:
         if logged_in:
             console.print("[green]claude CLI:[/] logged in.")
             if detail:
+                # Already a one-line account summary (see claude_code.cli_login_status);
+                # the splitlines guard is for the prose-output fallback.
                 console.print(f"  {detail.splitlines()[0]}")
             if claude_code.engine_model(settings.llm.model):
                 console.print(
