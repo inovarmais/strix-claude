@@ -1,0 +1,49 @@
+---
+title: "Claude Code Engine"
+description: "Run Strix with the Claude Code engine for local AI-assisted scanning"
+---
+
+## Overview
+
+The Claude Code engine lets you run Strix locally via the Claude Code CLI, leveraging your Claude subscription or API key. This is useful for air-gapped environments, offline scanning, or integrating Strix into local development workflows.
+
+## Prerequisites
+
+- [Claude Code CLI](https://claude.com/claude-code) installed and configured
+- Authenticated with `claude /login`
+
+## Setup
+
+```bash
+# Verify authentication
+claude /auth status
+
+# Use the Claude Code engine with Strix
+export STRIX_LLM="claude-code/claude-opus-4-6"
+strix --target ./app-directory
+```
+
+## Available Models
+
+| Model | Description |
+|-------|-------------|
+| `claude-code/claude-opus-4-6` | Maximum capability for deep analysis |
+| `claude-code/claude-sonnet-4-6` | Best balance of intelligence and speed |
+
+## Verify the Engine
+
+Check that the Claude Code engine is active:
+
+```bash
+strix auth status       # Shows active engine
+```
+
+## Auto-Resume on Quota
+
+For unattended runs that may exceed Claude's rate limits:
+
+```bash
+strix --target ./app-directory --auto-resume
+```
+
+With `--auto-resume`, Strix will automatically resume when quota limits reset, rather than exiting.
