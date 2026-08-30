@@ -13,13 +13,15 @@ from typing import TYPE_CHECKING, Any, cast
 from agents import RunConfig, Runner
 from agents.exceptions import AgentsException, MaxTurnsExceeded, UserError
 from agents.sandbox.errors import ExecTransportError
+from agents.sandbox.types import User
 from openai import (
     APIConnectionError,
     APIError,
     APITimeoutError,
 )
 
-from strix.config import codex
+from strix.config import claude_code, codex
+from strix.config.claude_code import SubscriptionQuotaExceededError
 from strix.core.hooks import (
     BudgetExceededError,
     BudgetPausedError,
@@ -45,6 +47,7 @@ if TYPE_CHECKING:
     from agents.result import RunResultBase
 
     from strix.core.agents import AgentCoordinator, Status
+    from strix.core.claude_code_execution import ClaudeCodeRunResult
 
 
 logger = logging.getLogger(__name__)
@@ -85,7 +88,9 @@ def _structured_provider_refusal(result: Any) -> str | None:
     return None
 
 
-def _run_config_model(run_config: RunConfig) -> str | None:
+def _run_config_model(run_config: RunConfig | None) -> str | None:
+    if run_config is None:
+        return None
     return run_config.model if isinstance(run_config.model, str) else None
 
 
@@ -183,7 +188,125 @@ async def _seed_and_prepare_first_input(
     return initial_input
 
 
+def _claude_code_engine_loop() -> Any:
+    """Import the Claude Code engine's run loop at call time.
+
+    ``claude-agent-sdk`` is an optional extra (``strix-agent[claude-code]``),
+    so importing it at module scope would break every install without it --
+    this module is on the critical path of every scan, on every provider.
+    """
+    try:
+        from strix.core.claude_code_execution import (
+            run_claude_code_agent_loop,
+        )
+    except ImportError as exc:
+        raise RuntimeError(
+            "STRIX_LLM=claude-code/<model> needs the Claude Code engine's optional "
+            "dependency. Install it with: pip install 'strix-agent[claude-code]'"
+        ) from exc
+    return run_claude_code_agent_loop
+
+
+def _sandbox_capability_tools(agent: Any, context: dict[str, Any]) -> list[Any]:
+    """The filesystem/shell tools a ``SandboxAgent``'s capabilities expose.
+
+    ``build_strix_agent`` puts shell and filesystem access in
+    ``SandboxAgent(capabilities=[Filesystem(...), Shell(...)])``, not in
+    ``agent.tools``: the agents SDK materializes those tools per run by binding
+    each capability to the live sandbox session (``agents.sandbox.runtime``).
+    The Claude Code engine never enters that runtime, so it performs the same
+    binding itself against the session the runner put in ``context`` --
+    otherwise a Claude-Code-driven agent has no way to run a command or touch a
+    file in the sandbox.
+    """
+    session = context.get("sandbox_session")
+    capabilities = getattr(agent, "capabilities", None) or ()
+    if session is None or not capabilities:
+        return []
+    run_as = getattr(agent, "run_as", None)
+    if isinstance(run_as, str):
+        run_as = User(name=run_as)
+    tools: list[Any] = []
+    for capability in capabilities:
+        bound = capability.clone()
+        bound.bind(session)
+        bound.bind_run_as(run_as)
+        tools.extend(bound.tools())
+    return tools
+
+
 async def run_agent_loop(
+    *,
+    agent: Any,
+    initial_input: Any,
+    run_config: RunConfig,
+    context: dict[str, Any],
+    max_turns: int,
+    coordinator: AgentCoordinator,
+    agent_id: str,
+    interactive: bool,
+    session: Session | None = None,
+    start_parked: bool = False,
+    event_sink: StreamEventSink | None = None,
+    hooks: RunHooks[dict[str, Any]] | None = None,
+) -> RunResultBase | ClaudeCodeRunResult | None:
+    """Dispatch one agent's turn loop to the model's engine.
+
+    A ``claude-code/<model>`` ``STRIX_LLM`` routes to the Claude Code engine
+    (the real ``claude`` CLI); every other model keeps using the
+    OpenAI-Agents-SDK loop in ``_run_agent_loop_default_engine``. Kept as a
+    thin wrapper rather than a branch inside that loop so the two engines'
+    control flow stays fully separate.
+    """
+    model_slug = claude_code.engine_model(_run_config_model(run_config))
+    if model_slug is not None:
+        run_claude_code_agent_loop = _claude_code_engine_loop()
+        claude_code_result = await run_claude_code_agent_loop(
+            tools=[
+                *(getattr(agent, "tools", []) or []),
+                *_sandbox_capability_tools(agent, context),
+            ],
+            instructions=_agent_instructions(agent),
+            model_slug=model_slug,
+            # Passed through unstringified: it is a task string on a fresh run,
+            # a ``child_initial_input`` message list for a spawned sub-agent,
+            # and ``[]`` on resume/respawn. The engine normalizes all three --
+            # ``str()`` here turned the last two into "[]" and a Python repr.
+            initial_input=initial_input,
+            max_turns=max_turns,
+            max_budget_usd=context.get("max_budget_usd"),
+            context=context,
+            coordinator=coordinator,
+            agent_id=agent_id,
+            is_root=context.get("parent_id") is None,
+            interactive=interactive,
+            session=session,
+            start_parked=start_parked,
+            event_sink=event_sink,
+            # The engine enforces the budget itself (it never runs these hooks),
+            # but reads the current ceiling from them so a budget the user
+            # extends mid-run is honored on this engine too.
+            budget_hooks=hooks,
+        )
+        return cast("ClaudeCodeRunResult | None", claude_code_result)
+
+    return await _run_agent_loop_default_engine(
+        agent=agent,
+        initial_input=initial_input,
+        run_config=run_config,
+        context=context,
+        max_turns=max_turns,
+        coordinator=coordinator,
+        agent_id=agent_id,
+        interactive=interactive,
+        session=session,
+        start_parked=start_parked,
+        event_sink=event_sink,
+        hooks=hooks,
+    )
+
+
+async def _run_agent_loop_default_engine(
     *,
     agent: Any,
     initial_input: Any,
@@ -527,7 +650,10 @@ async def _run_until_lifecycle(
         )
 
         if recoveries >= recovery_limit:
-            return await _exhausted_recovery(coordinator, agent_id, result, interactive=interactive)
+            return cast(
+                "RunResultBase | None",
+                await _exhausted_recovery(coordinator, agent_id, result, interactive=interactive),
+            )
 
         input_data = await _append_tool_required_message(
             session=session,
@@ -541,10 +667,10 @@ async def _run_until_lifecycle(
 async def _exhausted_recovery(
     coordinator: AgentCoordinator,
     agent_id: str,
-    result: RunResultBase | None,
+    result: RunResultBase | ClaudeCodeRunResult | None,
     *,
     interactive: bool,
-) -> RunResultBase | None:
+) -> RunResultBase | ClaudeCodeRunResult | None:
     """Settle an agent that never recovered into a tool call.
 
     Interactive runs park instead of dying: a human is attached and can message
@@ -829,15 +955,19 @@ def _final_output_preview(result: RunResultBase | None) -> str:
     return text[:300]
 
 
-async def _append_tool_required_message(
+def tool_required_message(
     *,
-    session: Session | None,
-    context: dict[str, Any],
+    finish_tool: str,
     attempt: int,
     limit: int,
     interactive: bool,
-) -> list[dict[str, str]]:
-    finish_tool = "finish_scan" if context.get("parent_id") is None else "agent_finish"
+) -> str:
+    """The nudge sent to an agent that ended a turn without a lifecycle tool call.
+
+    Engine-agnostic on purpose: the Claude Code engine's own lifecycle recovery
+    loop sends the same wording, so an agent sees identical guidance whichever
+    engine is driving it.
+    """
     if interactive:
         message = (
             "Your previous message ended a turn without a tool call. Plain text never ends "
@@ -860,6 +990,23 @@ async def _append_tool_required_message(
             "Otherwise use the appropriate execution or planning tool. "
             f"This is recovery attempt {attempt}/{limit}."
         )
+    return message
+
+
+async def _append_tool_required_message(
+    *,
+    session: Session | None,
+    context: dict[str, Any],
+    attempt: int,
+    limit: int,
+    interactive: bool,
+) -> list[dict[str, str]]:
+    message = tool_required_message(
+        finish_tool="finish_scan" if context.get("parent_id") is None else "agent_finish",
+        attempt=attempt,
+        limit=limit,
+        interactive=interactive,
+    )
     item = {"role": "user", "content": message}
     if session is None:
         return [item]
@@ -1014,11 +1161,12 @@ async def _start_child_runner(
     child_ctx["task"] = task
 
     async def _child_loop() -> None:
-        # A budget stop is a clean scan-wide shutdown, not a child failure: the
-        # child's status and parent notification are already settled in
-        # ``_run_cycle``. Swallow it here so the detached task does not surface a
-        # spurious "Task exception was never retrieved" warning. The root agent
-        # hits the same limit on its next call and tears the scan down.
+        # A budget stop -- or a Claude Code subscription quota stop -- is a clean
+        # scan-wide shutdown, not a child failure: the child's status and parent
+        # notification are already settled by the engine that raised. Swallow it
+        # here so the detached task does not surface a spurious "Task exception
+        # was never retrieved" warning. The root agent hits the same limit on its
+        # next call and tears the scan down.
         try:
             await run_agent_loop(
                 agent=child_agent,
@@ -1038,6 +1186,8 @@ async def _start_child_runner(
             logger.info("child %s stopped after reaching the scan budget limit", child_id)
         except SubagentBudgetReservedError:
             logger.info("child %s stopped at the sub-agent budget reserve", child_id)
+        except SubscriptionQuotaExceededError:
+            logger.info("child %s stopped: Claude Code subscription quota exhausted", child_id)
         finally:
             if not coordinator.is_shutting_down:
                 await _notify_parent_on_exit(coordinator, child_id)

@@ -280,6 +280,18 @@ Examples:
         ),
     )
 
+    parser.add_argument(
+        "--auto-resume",
+        action="store_true",
+        default=False,
+        help=(
+            "On a Claude Code subscription quota/usage-limit stop, sleep until the "
+            "reported reset time and continue automatically instead of exiting. "
+            "For unattended/CI runs; the default is to exit and print "
+            "'strix --resume <run_name>'."
+        ),
+    )
+
     args = parser.parse_args()
     # Startup-resolved state lives alongside the parsed flags. The full schema
     # is established here so downstream code reads attributes directly.

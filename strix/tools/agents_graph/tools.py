@@ -747,8 +747,9 @@ async def stop_agent(
     # The stopper knows what it just did; anyone else waiting on those agents does not.
     async with coordinator._lock:
         orphaned = [aid for aid in stopped if coordinator.parent_of.get(aid) not in (None, me)]
-    for aid in orphaned:
-        await notify_parent_on_terminal(coordinator, aid, "stopped")
+    if orphaned:
+        for aid in orphaned:
+            await notify_parent_on_terminal(coordinator, aid, "stopped")
 
     logger.info(
         "stop_agent: target=%s cascade=%s reason=%r",

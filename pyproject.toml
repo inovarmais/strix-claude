@@ -54,6 +54,7 @@ dependencies = [
 [project.optional-dependencies]
 vertex = ["google-auth>=2.0.0"]
 bedrock = ["boto3>=1.28.0"]
+claude-code = ["claude-agent-sdk>=0.2.148"]
 
 [project.scripts]
 strix = "strix.interface.main:main"
@@ -295,7 +296,8 @@ ignore = [
 "strix/report/usage.py" = ["PLC0415"]
 # LiteLLM and the Docker SDK are imported on first use, not at module scope:
 # both cost seconds to import and neither is needed until a model call is made
-# (or, for Docker, unless the Docker runtime backend is in use).
+# (or, for Docker, unless the Docker runtime backend is in use). The Claude Code
+# engine is imported the same way because claude-agent-sdk is an optional extra.
 "strix/core/execution.py" = ["PLC0415"]
 "strix/report/pricing.py" = ["PLC0415"]
 "strix/llm/compaction.py" = ["PLC0415"]

@@ -209,6 +209,11 @@ class TuiLiveView:
 
     def ingest_sdk_event(self, agent_id: str, event: Any) -> None:
         event_type = getattr(event, "type", "")
+        if not event_type:
+            # The Claude Code engine streams claude-agent-sdk message objects,
+            # which carry no ``type`` field. Project them onto the same events.
+            self._ingest_claude_code_message(agent_id, event)
+            return
         if event_type == "raw_response_event":
             self._ingest_raw_response_event(agent_id, getattr(event, "data", None))
             return
@@ -229,6 +234,44 @@ class TuiLiveView:
 
     def has_events_for_agent(self, agent_id: str) -> bool:
         return any(event.get("agent_id") == agent_id for event in self.events)
+
+    def _ingest_claude_code_message(self, agent_id: str, message: Any) -> None:
+        """Project one claude-agent-sdk message onto the transcript's events.
+
+        Duck-typed on the block shapes (``text``; ``id`` + ``name`` + ``input``;
+        ``tool_use_id`` + ``content``) so the TUI never imports the optional
+        ``claude-agent-sdk`` package. Anything else -- system messages, the
+        terminal result message, thinking blocks -- is not part of the
+        transcript and is skipped.
+        """
+        content = getattr(message, "content", None)
+        if not isinstance(content, list):
+            return
+        for block in content:
+            text = getattr(block, "text", None)
+            tool_use_id = getattr(block, "tool_use_id", None)
+            name = getattr(block, "name", None)
+            block_id = getattr(block, "id", None)
+            if isinstance(text, str):
+                self._record_assistant_message(agent_id, text, final=True)
+            elif isinstance(tool_use_id, str):
+                self._record_tool_output_data(
+                    agent_id,
+                    {
+                        "call_id": tool_use_id,
+                        "tool_name": "tool",
+                        "output": _claude_block_text(getattr(block, "content", None)),
+                    },
+                )
+            elif isinstance(name, str) and isinstance(block_id, str):
+                self._record_tool_call_data(
+                    agent_id,
+                    {
+                        "call_id": block_id,
+                        "tool_name": _strip_bridge_prefix(name),
+                        "args": getattr(block, "input", None) or {},
+                    },
+                )
 
     def _ingest_raw_response_event(self, agent_id: str, data: Any) -> None:
         data_type = getattr(data, "type", "")
@@ -408,6 +451,25 @@ class TuiLiveView:
     def _bump_event(event: dict[str, Any], *, timestamp: str | None = None) -> None:
         event["version"] = int(event.get("version", 0)) + 1
         event["timestamp"] = timestamp or datetime.now(UTC).isoformat()
+
+
+_BRIDGE_TOOL_PREFIX = "mcp__strix__"
+
+
+def _strip_bridge_prefix(tool_name: str) -> str:
+    """Strix's own tools reach the Claude Code engine as ``mcp__strix__<name>``."""
+    return tool_name.removeprefix(_BRIDGE_TOOL_PREFIX)
+
+
+def _claude_block_text(content: Any) -> str:
+    """Text of a claude-agent-sdk ``ToolResultBlock``'s content."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            str(part.get("text", "")) for part in content if isinstance(part, dict)
+        )
+    return ""
 
 
 def _sdk_tool_call_data(item: Any) -> dict[str, Any]:

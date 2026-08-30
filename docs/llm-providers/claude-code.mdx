@@ -1,0 +1,66 @@
+---
+title: "Claude Code Engine"
+description: "Run a scan on your Claude subscription, driven by the Claude Code CLI"
+---
+
+## Overview
+
+The Claude Code engine runs a scan on your existing Claude subscription
+(Pro/Max/Team/Enterprise) instead of a metered API key. The real `claude` CLI
+drives each agent's turn-by-turn reasoning and tool calls, while every action
+against the target still goes through Strix's own sandboxed tools — the same
+sandbox, proxy, reporting and multi-agent graph as any other provider.
+
+Strix never reads or stores Anthropic credentials: it reuses whatever account
+the `claude` CLI is already signed in to.
+
+## Setup
+
+```bash
+# 1. Install Strix with the Claude Code extra
+pip install 'strix-agent[claude-code]'
+
+# 2. Install the Claude Code CLI and sign in
+claude /login
+
+# 3. Point Strix at the engine
+export STRIX_LLM="claude-code/sonnet"
+strix --target ./app-directory
+```
+
+## Available Models
+
+Any model slug the `claude` CLI accepts, after the `claude-code/` prefix:
+
+| Model | Description |
+|-------|-------------|
+| `claude-code/sonnet` | Best balance of intelligence and speed |
+| `claude-code/opus` | Maximum capability for deep analysis |
+| `claude-code/haiku` | Fastest and cheapest against your quota |
+
+## Verify the Setup
+
+```bash
+claude auth status   # the CLI's own login state (JSON)
+strix auth status    # also reports whether Strix can use the engine
+```
+
+If the CLI is missing or signed out, a `claude-code/` run fails fast at startup
+with the command to fix it.
+
+## Auto-Resume on Quota
+
+A Claude subscription's usage limit resets on a multi-hour window. When a scan
+hits it, Strix stops cleanly and prints the reset time plus the exact resume
+command:
+
+```bash
+strix --resume <run_name>
+```
+
+For unattended or CI runs, `--auto-resume` sleeps until the reported reset and
+continues the same run instead of exiting:
+
+```bash
+strix --target ./app-directory --auto-resume
+```

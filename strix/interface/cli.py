@@ -200,6 +200,7 @@ async def run_cli(args: Any) -> None:  # noqa: PLR0915
                     max_budget_usd=getattr(args, "max_budget_usd", None),
                     max_turns=getattr(args, "max_turns", DEFAULT_MAX_TURNS),
                     status_sink=_note_startup_phase,
+                    auto_resume=bool(getattr(args, "auto_resume", False)),
                 )
             finally:
                 stop_updates.set()
