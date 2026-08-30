@@ -54,6 +54,7 @@ dependencies = [
 [project.optional-dependencies]
 vertex = ["google-auth>=2.0.0"]
 bedrock = ["boto3>=1.28.0"]
+claude-code = ["claude-agent-sdk>=0.1.0"]
 
 [project.scripts]
 strix = "strix.interface.main:main"
