@@ -617,7 +617,7 @@ async def _run_strix_scan_once(
             with contextlib.suppress(Exception):
                 await coordinator.set_status(root_id, "stopped")
         return None
-    except (RateLimitError, SubscriptionQuotaExceededError) as exc:
+    except RateLimitError as exc:
         logger.warning(
             "Scan %s stopped: persistent rate limit from the LLM provider (%s). "
             "Resume with 'strix --resume %s' once the limit clears.",
@@ -663,6 +663,12 @@ async def _run_strix_scan_once(
         teardown_logging()
 
 
+# ponytail: fixed cap + sleep floor, not exponential backoff/config; revisit if
+# quota resets ever legitimately need >10 sleep-and-retry cycles in one run.
+_MAX_AUTO_RESUME_RETRIES = 10
+_MIN_AUTO_RESUME_SLEEP_SECONDS = 5.0
+
+
 async def run_strix_scan(
     *,
     auto_resume: bool = False,
@@ -672,15 +678,19 @@ async def run_strix_scan(
     full parameter list and behavior.
 
     ``auto_resume=True`` additionally catches a Claude Code subscription
-    quota stop, sleeps until the reported reset time, and continues the
-    same run (by scan_id) instead of returning ``None``.
+    quota stop (propagated up from ``_run_strix_scan_once``, which does not
+    catch it), sleeps until the reported reset time, and continues the same
+    run (by scan_id) instead of returning ``None``. Capped at
+    ``_MAX_AUTO_RESUME_RETRIES`` retries as a safety net against a
+    misbehaving ``reset_at``.
     """
     scan_id = kwargs.get("scan_id")
+    retries = 0
     while True:
         try:
             return await _run_strix_scan_once(**kwargs)
         except SubscriptionQuotaExceededError as exc:
-            if not auto_resume or scan_id is None:
+            if not auto_resume:
                 logger.warning(
                     "Scan %s stopped: Claude Code subscription quota exhausted (%s). "
                     "Resume with 'strix --resume %s' once it resets.",
@@ -689,17 +699,42 @@ async def run_strix_scan(
                     scan_id,
                 )
                 return None
+            if scan_id is None:
+                logger.warning(
+                    "Scan %s stopped: Claude Code subscription quota exhausted (%s). "
+                    "--auto-resume was set but there is no scan_id to resume, so it "
+                    "cannot be honored; start a fresh scan once the quota resets.",
+                    scan_id,
+                    exc,
+                )
+                return None
+            if retries >= _MAX_AUTO_RESUME_RETRIES:
+                logger.warning(
+                    "Scan %s stopped: Claude Code subscription quota exhausted (%s) "
+                    "again after %d --auto-resume retries. Giving up; resume manually "
+                    "with 'strix --resume %s' once it resets.",
+                    scan_id,
+                    exc,
+                    retries,
+                    scan_id,
+                )
+                return None
+            retries += 1
             wait_seconds = (
                 max((exc.reset_at - datetime.now(UTC)).total_seconds(), 0.0)
                 if exc.reset_at
                 else 0.0
             )
+            wait_seconds = max(wait_seconds, _MIN_AUTO_RESUME_SLEEP_SECONDS)
             logger.warning(
                 "Scan %s paused: Claude Code subscription quota exhausted (%s). "
-                "--auto-resume is set; sleeping %.0fs until the reported reset.",
+                "--auto-resume is set; sleeping %.0fs until the reported reset "
+                "(retry %d/%d).",
                 scan_id,
                 exc,
                 wait_seconds,
+                retries,
+                _MAX_AUTO_RESUME_RETRIES,
             )
             await asyncio.sleep(wait_seconds)
             kwargs["scan_id"] = scan_id  # unchanged; the next call resumes this run
