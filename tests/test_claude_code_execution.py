@@ -227,11 +227,14 @@ async def test_run_raises_subscription_quota_error_on_rate_limit_event(
 
 
 @pytest.mark.asyncio
-async def test_run_ignores_non_rejected_rate_limit_events(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("status", ["allowed", "allowed_warning"])
+async def test_run_ignores_non_rejected_rate_limit_events(
+    status: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """``allowed``/``allowed_warning`` rate-limit events are informational --
     they must not be mistaken for a quota-exceeded signal."""
     warning = RateLimitEvent(
-        rate_limit_info=RateLimitInfo(status="allowed_warning", resets_at=None),
+        rate_limit_info=RateLimitInfo(status=status, resets_at=None),  # type: ignore[arg-type]
         uuid="evt-1",
         session_id="sess-1",
     )

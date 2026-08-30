@@ -13,10 +13,10 @@ Quota-exceeded detection has two layers:
   "rejected"`` -- the CLI's own authoritative signal, confirmed against the
   installed ``claude_agent_sdk`` package (see ``_internal/message_parser.py``,
   which builds it straight from the CLI's ``rate_limit_event`` JSON message).
-  ``resets_at`` is a Unix timestamp in seconds (confirmed via the bundled
-  CLI's ``resetsAtSeconds`` string constant next to the "usage limit resets"
-  copy, and the SDK docstring "Unix timestamp when the rate limit window
-  resets" with no "ms" qualifier).
+  ``resets_at`` is assumed to be a Unix timestamp in seconds, consistent
+  with the SDK docstring ("Unix timestamp when the rate limit window
+  resets", no "ms" qualifier) and a ``resetsAtSeconds`` string spotted in
+  the bundled CLI binary next to its "usage limit resets" copy.
 - Fallback: free-text detection (``classify_quota_error``) against the final
   ``ResultMessage.result``, in case a CLI version ever terminates without
   emitting a ``RateLimitEvent`` first.
@@ -38,9 +38,11 @@ from strix.config.claude_code import SubscriptionQuotaExceededError, classify_qu
 from strix.core.hooks import (
     # Reused intentionally from strix.core.hooks despite the leading
     # underscore: both engines share one set of wind-down bands/directives
-    # so the agent sees identical wording regardless of which engine is
-    # driving it. See strix/core/hooks.py.
+    # and the same sub-agent budget reserve fraction, so behavior (and any
+    # future tuning) stays identical regardless of which engine is driving
+    # the agent. See strix/core/hooks.py.
     _ROOT_DIRECTIVES,
+    _SUBAGENT_BUDGET_RESERVE,
     _SUBAGENT_DIRECTIVES,
     _TURN_WARN_BANDS,
     BudgetExceededError,
@@ -59,8 +61,6 @@ if TYPE_CHECKING:
     from strix.core.execution import StreamEventSink
 
 logger = logging.getLogger(__name__)
-
-_SUBAGENT_BUDGET_RESERVE = 0.90
 
 
 @dataclass
