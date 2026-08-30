@@ -8,7 +8,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
 
-from strix.config import codex, load_settings
+from strix.config import claude_code, codex, load_settings
 from strix.interface.utils import (
     check_docker_connection,
     image_exists,
@@ -35,6 +35,23 @@ def validate_environment() -> None:
             )
             sys.exit(1)
         logger.info("Environment OK (ChatGPT subscription)")
+        return
+
+    if claude_code.engine_model(settings.llm.model):
+        if not claude_code.is_cli_available():
+            console.print(
+                f"[red]STRIX_LLM={settings.llm.model} uses the Claude Code engine, "
+                "but the `claude` CLI isn't installed.[/] Install Claude Code, then re-run."
+            )
+            sys.exit(1)
+        logged_in, _detail = claude_code.cli_login_status()
+        if not logged_in:
+            console.print(
+                f"[red]STRIX_LLM={settings.llm.model} uses the Claude Code engine, "
+                "but `claude` isn't signed in.[/] Run [cyan]claude /login[/] first."
+            )
+            sys.exit(1)
+        logger.info("Environment OK (Claude Code engine)")
         return
 
     if not settings.llm.model:
