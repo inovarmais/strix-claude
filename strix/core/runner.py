@@ -9,6 +9,7 @@ import json
 import logging
 import uuid
 from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -19,6 +20,7 @@ from openai import RateLimitError
 from strix.agents.factory import build_strix_agent, make_child_factory
 from strix.agents.prompt import render_system_prompt
 from strix.config import load_settings
+from strix.config.claude_code import SubscriptionQuotaExceededError
 from strix.config.models import (
     StrixProvider,
     configure_sdk_model_defaults,
@@ -180,7 +182,7 @@ def _compose_root_instructions_override(
     )
 
 
-async def run_strix_scan(
+async def _run_strix_scan_once(
     *,
     scan_config: dict[str, Any],
     scan_id: str | None = None,
@@ -615,7 +617,7 @@ async def run_strix_scan(
             with contextlib.suppress(Exception):
                 await coordinator.set_status(root_id, "stopped")
         return None
-    except RateLimitError as exc:
+    except (RateLimitError, SubscriptionQuotaExceededError) as exc:
         logger.warning(
             "Scan %s stopped: persistent rate limit from the LLM provider (%s). "
             "Resume with 'strix --resume %s' once the limit clears.",
@@ -659,3 +661,45 @@ async def run_strix_scan(
             await session_manager.cleanup(scan_id)
         logger.info("Strix scan %s done", scan_id)
         teardown_logging()
+
+
+async def run_strix_scan(
+    *,
+    auto_resume: bool = False,
+    **kwargs: Any,
+) -> RunResultBase | ClaudeCodeRunResult | None:
+    """Run (or resume) one Strix scan; see ``_run_strix_scan_once`` for the
+    full parameter list and behavior.
+
+    ``auto_resume=True`` additionally catches a Claude Code subscription
+    quota stop, sleeps until the reported reset time, and continues the
+    same run (by scan_id) instead of returning ``None``.
+    """
+    scan_id = kwargs.get("scan_id")
+    while True:
+        try:
+            return await _run_strix_scan_once(**kwargs)
+        except SubscriptionQuotaExceededError as exc:
+            if not auto_resume or scan_id is None:
+                logger.warning(
+                    "Scan %s stopped: Claude Code subscription quota exhausted (%s). "
+                    "Resume with 'strix --resume %s' once it resets.",
+                    scan_id,
+                    exc,
+                    scan_id,
+                )
+                return None
+            wait_seconds = (
+                max((exc.reset_at - datetime.now(UTC)).total_seconds(), 0.0)
+                if exc.reset_at
+                else 0.0
+            )
+            logger.warning(
+                "Scan %s paused: Claude Code subscription quota exhausted (%s). "
+                "--auto-resume is set; sleeping %.0fs until the reported reset.",
+                scan_id,
+                exc,
+                wait_seconds,
+            )
+            await asyncio.sleep(wait_seconds)
+            kwargs["scan_id"] = scan_id  # unchanged; the next call resumes this run
