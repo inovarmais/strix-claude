@@ -1,11 +1,30 @@
 """Claude Code agent engine: drives one agent's turn loop via the real
 ``claude`` CLI (through ``claude-agent-sdk``), for STRIX_LLM=claude-code/<model>.
 
-Every tool call still executes through Strix's existing implementations
-(bridged in via ``strix.agents.claude_code_tools``); this module is only
-responsible for the turn loop, cost/turn accounting, and translating the
-SDK's own error signals into the exceptions ``strix.core.runner`` and
-``strix.core.agents.AgentCoordinator`` already know how to handle.
+Every tool call against the scan target still executes through Strix's existing
+implementations (bridged in via ``strix.agents.claude_code_tools``, including
+the shell/filesystem tools the agents SDK's sandbox capabilities expose); this
+module is responsible for the turn loop, lifecycle recovery, cost/turn
+accounting, and translating the SDK's own error signals into the exceptions
+``strix.core.runner`` and ``strix.core.agents.AgentCoordinator`` already know
+how to handle.
+
+Native tool scoping (what is actually enforced):
+
+- Claude Code's own ``Bash``/``Read``/``Write``/``WebSearch`` stay available as
+  auxiliary research aids, but they must never reach the scan target. That is
+  enforced by ``ClaudeAgentOptions.sandbox`` (the CLI's real sandbox: bash runs
+  isolated with an empty network allow-list, and cannot opt out), not by ``cwd``
+  -- ``cwd`` is only a starting directory and jails nothing on its own.
+- ``tools=`` restricts which built-ins exist at all (``allowed_tools`` only
+  pre-approves them), and ``Bash`` is offered only on platforms whose CLI
+  sandbox can contain it (macOS/Linux); elsewhere there is nothing to contain a
+  native shell, so it is left out.
+- A ``PreToolUse`` hook additionally denies native file reads/writes outside the
+  agent's scratch directory. Belt-and-suspenders on top of the SDK sandbox, and
+  the layer that still applies where the OS sandbox does not.
+- ``WebSearch`` is unaffected by the network denial: it is served by Anthropic's
+  API backend, not by a host network call from a sandboxed command.
 
 Quota-exceeded detection has two layers:
 
@@ -24,17 +43,40 @@ Quota-exceeded detection has two layers:
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
+import shutil
+import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from tempfile import gettempdir
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
-from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, RateLimitEvent
+from claude_agent_sdk import (
+    ClaudeAgentOptions,
+    ClaudeSDKClient,
+    HookMatcher,
+    RateLimitEvent,
+    SandboxSettings,
+)
 
 from strix.agents.claude_code_tools import bridged_tool_names, build_mcp_server
 from strix.config.claude_code import SubscriptionQuotaExceededError, classify_quota_error
+from strix.core.execution import (
+    # Shared with the default engine on purpose: both engines nudge a
+    # lifecycle-less turn with the same wording, bound it by the same recovery
+    # limits, and settle an unrecoverable agent the same way.
+    _INTERACTIVE_TOOL_RECOVERY_LIMIT,
+    _MAX_IDLE_AUTO_RESUMES,
+    _agent_status,
+    _exhausted_recovery,
+    _notify_parent_on_stall,
+    _plain_waiting_timeout,
+    _reserve_notice,
+    tool_required_message,
+)
 from strix.core.hooks import (
     # Reused intentionally from strix.core.hooks despite the leading
     # underscore: both engines share one set of wind-down bands/directives
@@ -46,6 +88,7 @@ from strix.core.hooks import (
     _SUBAGENT_DIRECTIVES,
     _TURN_WARN_BANDS,
     BudgetExceededError,
+    BudgetPausedError,
     SubagentBudgetReservedError,
     _crossed_stage,
 )
@@ -53,14 +96,23 @@ from strix.report.state import get_global_report_state
 
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
 
+    from agents.memory import Session
     from agents.tool import Tool
 
     from strix.core.agents import AgentCoordinator
-    from strix.core.execution import StreamEventSink
 
 logger = logging.getLogger(__name__)
+
+_MCP_SERVER_NAME = "strix"
+_SCRATCH_DIR_NAME = "strix-claude-code-scratch"
+
+# Claude Code's own tools, kept as auxiliary research aids only.
+_NATIVE_TOOLS: tuple[str, ...] = ("Read", "Write", "WebSearch")
+# Platforms whose `claude` CLI can actually sandbox a bash command.
+_SANDBOXED_BASH_PLATFORMS = ("darwin", "linux")
+_NATIVE_PATH_ARGUMENTS = ("file_path", "path", "notebook_path")
 
 
 @dataclass
@@ -93,33 +145,138 @@ def _quota_error_from_rate_limit(event: RateLimitEvent) -> SubscriptionQuotaExce
     return SubscriptionQuotaExceededError(f"Claude Code {label} rate limit rejected", reset_at)
 
 
-def _scratch_cwd(agent_id: str) -> str:
-    path = Path(gettempdir()) / "strix-claude-code-scratch" / agent_id
+def _scratch_cwd(agent_id: str) -> Path:
+    path = Path(gettempdir()) / _SCRATCH_DIR_NAME / agent_id
     path.mkdir(parents=True, exist_ok=True)
-    return str(path)
+    return path
+
+
+def _clear_scratch_cwd(agent_id: str) -> None:
+    """Drop the agent's native-tool scratch directory when its session ends."""
+    shutil.rmtree(Path(gettempdir()) / _SCRATCH_DIR_NAME / agent_id, ignore_errors=True)
+
+
+def _native_tools() -> list[str]:
+    if sys.platform.startswith(_SANDBOXED_BASH_PLATFORMS):
+        return ["Bash", *_NATIVE_TOOLS]
+    return list(_NATIVE_TOOLS)
+
+
+def _sandbox_settings() -> SandboxSettings:
+    """``ClaudeAgentOptions.sandbox`` value: native commands get no network.
+
+    Shaped against the installed ``claude_agent_sdk``'s ``SandboxSettings``
+    TypedDict. An empty ``allowedDomains`` leaves a sandboxed command with
+    nothing it may reach, and ``allowUnsandboxedCommands: False`` means a
+    command cannot opt out of the sandbox -- so the scan target is reachable
+    only through Strix's own (proxied, logged, scope-checked) tools.
+    """
+    return {
+        "enabled": True,
+        "autoAllowBashIfSandboxed": True,
+        "allowUnsandboxedCommands": False,
+        "network": {"allowedDomains": [], "allowAllUnixSockets": False},
+    }
+
+
+def _is_within(root: Path, candidate: str) -> bool:
+    try:
+        path = Path(candidate)
+        resolved = (path if path.is_absolute() else root / path).resolve()
+    except (OSError, ValueError):
+        return False
+    return resolved == root or resolved.is_relative_to(root)
+
+
+def _scratch_path_guard(scratch: Path) -> Callable[..., Any]:
+    """A ``PreToolUse`` hook denying native file access outside ``scratch``.
+
+    Unlike ``can_use_tool``, a ``PreToolUse`` hook runs for every tool call,
+    including ones already pre-approved through ``allowed_tools``.
+    """
+    root = scratch.resolve()
+
+    async def guard(
+        hook_input: dict[str, Any], _tool_use_id: str | None, _context: Any
+    ) -> dict[str, Any]:
+        tool_input = hook_input.get("tool_input") or {}
+        for key in _NATIVE_PATH_ARGUMENTS:
+            value = tool_input.get(key)
+            if not isinstance(value, str) or not value or _is_within(root, value):
+                continue
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": (
+                        f"Native file access is limited to this agent's scratch directory "
+                        f"({root}). Reach the scan target through Strix's own sandbox tools "
+                        f"(exec_command, apply_patch, view_image) instead."
+                    ),
+                }
+            }
+        return {}
+
+    return guard
 
 
 def _build_options(
-    *, tools: Sequence[Tool], instructions: str, model_slug: str, max_turns: int, agent_id: str
+    *,
+    tools: Sequence[Tool],
+    instructions: str,
+    model_slug: str,
+    max_turns: int,
+    agent_id: str,
+    context: dict[str, Any],
 ) -> ClaudeAgentOptions:
-    server = build_mcp_server(tools, name="strix")
-    allowed = [
-        *bridged_tool_names(tools, server_name="strix"),
-        "Bash",
-        "Read",
-        "Write",
-        "WebSearch",
-    ]
+    server = build_mcp_server(tools, context=context, name=_MCP_SERVER_NAME)
+    native = _native_tools()
+    scratch = _scratch_cwd(agent_id)
     return ClaudeAgentOptions(
         system_prompt=instructions,
         model=model_slug,
-        mcp_servers={"strix": server},
-        allowed_tools=allowed,
+        mcp_servers={_MCP_SERVER_NAME: server},
+        tools=native,
+        allowed_tools=[*bridged_tool_names(tools, server_name=_MCP_SERVER_NAME), *native],
         max_turns=max_turns,
-        # Auxiliary-only: outside the sandbox workspace, no target network
-        # access -- see "Native tool scoping" in the design spec.
-        cwd=_scratch_cwd(agent_id),
+        cwd=str(scratch),
+        sandbox=_sandbox_settings(),
+        hooks={
+            "PreToolUse": [
+                HookMatcher(matcher="Read|Write", hooks=[_scratch_path_guard(scratch)]),
+            ]
+        },
     )
+
+
+class _InterruptHandle:
+    """Maps the coordinator's stream cancellation onto the SDK's ``interrupt()``.
+
+    ``AgentCoordinator.send`` cancels an interactive agent's attached run stream
+    so a user message lands mid-turn. The Claude Code engine has no
+    agents-SDK stream, so this stands in for one and interrupts the CLI turn
+    instead; the loop then picks the queued message up on its next pass.
+    """
+
+    def __init__(self, client: Any) -> None:
+        self._client = client
+        self._interrupt_task: asyncio.Task[None] | None = None
+
+    def cancel(self, mode: str = "immediate") -> None:
+        # "after_turn" is a request to stop once the turn ends, which the
+        # loop's own status checks already honor.
+        if mode != "immediate":
+            return
+        with contextlib.suppress(RuntimeError):
+            # Held on the instance so the task is not garbage-collected mid-flight.
+            self._interrupt_task = asyncio.get_running_loop().create_task(self._interrupt())
+
+    async def _interrupt(self) -> None:
+        try:
+            await self._client.interrupt()
+        except Exception:  # noqa: BLE001 - interrupting is best-effort; a failure just
+            # means the queued message lands after the current turn instead of during it.
+            logger.debug("interrupting the in-flight Claude Code turn failed", exc_info=True)
 
 
 async def _check_already_stopped(
@@ -133,15 +290,18 @@ async def _check_already_stopped(
         raise SubagentBudgetReservedError("scan reached the sub-agent budget reserve")
 
 
-async def _apply_result_text(
-    message: object, *, coordinator: AgentCoordinator, agent_id: str, final_output: str | None
+async def _result_text(
+    message: object, *, coordinator: AgentCoordinator, agent_id: str
 ) -> str | None:
-    """Update ``final_output`` from a message's ``result``/``is_error`` fields
-    (duck-typed: only ``ResultMessage`` carries them), raising the free-text
-    quota fallback when the terminal result reads like a usage-limit message."""
+    """A message's ``result`` text, or None if it carries none.
+
+    Duck-typed: only ``ResultMessage`` has ``result``/``is_error``. Raises the
+    free-text quota fallback when a terminal error result reads like a
+    usage-limit message.
+    """
     result_text = getattr(message, "result", None)
     if not isinstance(result_text, str):
-        return final_output
+        return None
     if bool(getattr(message, "is_error", False)):
         quota_error = classify_quota_error(result_text)
         if quota_error is not None:
@@ -153,7 +313,11 @@ async def _apply_result_text(
 def _log_turn_stage(
     message: object, *, turns_used: int, max_turns: int, is_root: bool, agent_id: str
 ) -> int:
-    turns_used = int(getattr(message, "num_turns", turns_used) or turns_used)
+    reported = getattr(message, "num_turns", None)
+    # Monotonic: the CLI's num_turns may be per-response or session-cumulative,
+    # and taking the max is right either way (it never double-counts).
+    if isinstance(reported, int):
+        turns_used = max(turns_used, reported)
     stage = _crossed_stage(turns_used / max_turns, _TURN_WARN_BANDS) if max_turns else None
     if stage is not None:
         logger.info(
@@ -196,6 +360,185 @@ async def _apply_cost(
         )
 
 
+@dataclass
+class _EngineTurn:
+    """What one ``query`` -> ``receive_response`` pass produced."""
+
+    final_output: str | None
+    turns_used: int
+
+
+async def _consume_response(
+    client: Any,
+    *,
+    coordinator: AgentCoordinator,
+    agent_id: str,
+    is_root: bool,
+    max_turns: int,
+    max_budget_usd: float | None,
+    event_sink: Callable[[str, Any], None] | None,
+    turns_used: int,
+) -> _EngineTurn:
+    final_output: str | None = None
+    async for message in client.receive_response():
+        if event_sink is not None:
+            try:
+                event_sink(agent_id, message)
+            except Exception:
+                logger.exception("stream event sink failed for %s", agent_id)
+
+        if isinstance(message, RateLimitEvent):
+            quota_error = _quota_error_from_rate_limit(message)
+            if quota_error is not None:
+                await coordinator.set_status(agent_id, "stopped")
+                raise quota_error
+            continue
+
+        text = await _result_text(message, coordinator=coordinator, agent_id=agent_id)
+        if text is not None:
+            final_output = text
+        turns_used = _log_turn_stage(
+            message,
+            turns_used=turns_used,
+            max_turns=max_turns,
+            is_root=is_root,
+            agent_id=agent_id,
+        )
+        await _apply_cost(
+            message,
+            coordinator=coordinator,
+            agent_id=agent_id,
+            is_root=is_root,
+            max_budget_usd=max_budget_usd,
+        )
+    return _EngineTurn(final_output=final_output, turns_used=turns_used)
+
+
+async def _run_until_lifecycle(
+    client: Any,
+    *,
+    prompt: str,
+    coordinator: AgentCoordinator,
+    agent_id: str,
+    is_root: bool,
+    interactive: bool,
+    max_turns: int,
+    max_budget_usd: float | None,
+    event_sink: Callable[[str, Any], None] | None,
+    turns_used: int,
+) -> tuple[ClaudeCodeRunResult | None, int]:
+    """Drive the CLI session until an explicit lifecycle tool settles the status.
+
+    The Claude Code counterpart of ``strix.core.execution._run_until_lifecycle``:
+    a turn that ends without ``finish_scan``/``agent_finish``/
+    ``respond_to_user``/``wait_for_agents`` leaves the agent ``running``, and is
+    nudged back into a tool call, bounded by the same recovery limit.
+    """
+    recovery_limit = _INTERACTIVE_TOOL_RECOVERY_LIMIT if interactive else max(1, max_turns)
+    result: ClaudeCodeRunResult | None = None
+    text = prompt
+
+    while True:
+        await _check_already_stopped(coordinator=coordinator, agent_id=agent_id, is_root=is_root)
+        await coordinator.mark_running(agent_id)
+        await client.query(text)
+        turn = await _consume_response(
+            client,
+            coordinator=coordinator,
+            agent_id=agent_id,
+            is_root=is_root,
+            max_turns=max_turns,
+            max_budget_usd=max_budget_usd,
+            event_sink=event_sink,
+            turns_used=turns_used,
+        )
+        turns_used = turn.turns_used
+        result = ClaudeCodeRunResult(final_output=turn.final_output)
+
+        status = await _agent_status(coordinator, agent_id)
+        if status != "running":
+            await coordinator.reset_recovery(agent_id)
+            return result, turns_used
+
+        recoveries = await coordinator.record_recovery(agent_id)
+        logger.warning(
+            "agent %s ended a Claude Code turn without a lifecycle tool call "
+            "(interactive=%s); forcing tool continuation (%d/%d)",
+            agent_id,
+            interactive,
+            recoveries,
+            recovery_limit,
+        )
+        if recoveries >= recovery_limit:
+            settled = await _exhausted_recovery(
+                coordinator, agent_id, result, interactive=interactive
+            )
+            return settled if isinstance(settled, ClaudeCodeRunResult) else None, turns_used
+
+        text = tool_required_message(
+            finish_tool="finish_scan" if is_root else "agent_finish",
+            attempt=recoveries,
+            limit=recovery_limit,
+            interactive=interactive,
+        )
+
+
+def _pending_prompt(items: Sequence[Any]) -> str:
+    """Render the messages drained from the mailbox as one CLI prompt."""
+    parts = [
+        str(item.get("content", "")).strip()
+        for item in items
+        if isinstance(item, dict) and str(item.get("content", "")).strip()
+    ]
+    return "\n\n".join(parts)
+
+
+_AUTO_RESUME_MESSAGE = {
+    "from": "system",
+    "type": "auto_resume",
+    "content": "Waiting timeout reached. Resuming execution.",
+}
+
+
+async def _await_next_input(
+    *, coordinator: AgentCoordinator, agent_id: str, is_root: bool
+) -> str | None:
+    """Park until something is worth resuming on; None means stay parked.
+
+    Mirrors the interactive wait in ``strix.core.execution``: a real message
+    resets the nudge budget, a waiting timeout auto-resumes a limited number of
+    times, and an agent that keeps re-parking is left for a human.
+    """
+    timeout = await _plain_waiting_timeout(coordinator, agent_id)
+    woke = await coordinator.wait_for_message(agent_id, timeout=timeout)
+
+    await _check_already_stopped(coordinator=coordinator, agent_id=agent_id, is_root=is_root)
+
+    if woke:
+        # Real input is real progress, so the nudge budget starts over. A bare
+        # auto-resume is not: it must not hand a wedged agent a fresh budget.
+        await coordinator.reset_recovery(agent_id)
+        await coordinator.reset_idle_resumes(agent_id)
+    else:
+        idle_resumes = await coordinator.record_idle_resume(agent_id)
+        if idle_resumes >= _MAX_IDLE_AUTO_RESUMES:
+            logger.warning(
+                "agent %s auto-resumed %d times without hearing from anyone; "
+                "leaving it parked until a real message arrives",
+                agent_id,
+                idle_resumes,
+            )
+            await coordinator.park_waiting(agent_id, wait_kind="stalled")
+            # A parked child owes its parent a report it can no longer send.
+            await _notify_parent_on_stall(coordinator, agent_id)
+            return None
+        logger.info("agent %s reached its waiting timeout; auto-resuming", agent_id)
+        await coordinator.send(agent_id, dict(_AUTO_RESUME_MESSAGE), interrupt=False)
+
+    _count, items = await coordinator.consume_pending(agent_id, include_items=True)
+    return _pending_prompt(items) or "Continue."
+
+
 async def run_claude_code_agent_loop(
     *,
     tools: Sequence[Tool],
@@ -204,14 +547,28 @@ async def run_claude_code_agent_loop(
     initial_input: str,
     max_turns: int,
     max_budget_usd: float | None,
+    context: dict[str, Any],
     coordinator: AgentCoordinator,
     agent_id: str,
     is_root: bool,
-    event_sink: StreamEventSink | None = None,
+    interactive: bool = False,
+    session: Session | None = None,
+    start_parked: bool = False,
+    event_sink: Callable[[str, Any], None] | None = None,
 ) -> ClaudeCodeRunResult | None:
-    await coordinator.attach_runtime(agent_id, session=None, interrupt_on_message=False)
-    await coordinator.mark_running(agent_id)
+    """Run one agent's turn loop on the Claude Code engine.
+
+    Structurally the same shape as ``strix.core.execution``'s default-engine
+    loop: one lifecycle-bounded cycle, then (interactively) park for messages
+    and run another cycle each time one arrives. ``session`` is attached so the
+    coordinator persists queued messages for ``strix --resume``; the live
+    conversation itself lives in the CLI session held by the SDK client.
+    """
+    await coordinator.attach_runtime(agent_id, session=session, interrupt_on_message=interactive)
     await _check_already_stopped(coordinator=coordinator, agent_id=agent_id, is_root=is_root)
+
+    if coordinator.reserve_stopped and start_parked and interactive and is_root:
+        await coordinator.send(agent_id, _reserve_notice())
 
     options = _build_options(
         tools=tools,
@@ -219,45 +576,56 @@ async def run_claude_code_agent_loop(
         model_slug=model_slug,
         max_turns=max_turns,
         agent_id=agent_id,
+        context=context,
     )
 
-    final_output: str | None = None
+    result: ClaudeCodeRunResult | None = None
     turns_used = 0
-
     client = _open_client(options=options)
-    async with client:
-        await client.query(initial_input)
-        async for message in client.receive_response():
-            if event_sink is not None:
+    try:
+        async with client:
+            if not (start_parked and interactive):
+                with contextlib.suppress(BudgetPausedError):
+                    result, turns_used = await _run_until_lifecycle(
+                        client,
+                        prompt=initial_input,
+                        coordinator=coordinator,
+                        agent_id=agent_id,
+                        is_root=is_root,
+                        interactive=interactive,
+                        max_turns=max_turns,
+                        max_budget_usd=max_budget_usd,
+                        event_sink=event_sink,
+                        turns_used=turns_used,
+                    )
+
+            if not interactive:
+                return result
+
+            await coordinator.attach_stream(agent_id, _InterruptHandle(client))
+            while True:
                 try:
-                    event_sink(agent_id, message)
-                except Exception:
-                    logger.exception("stream event sink failed for %s", agent_id)
-
-            if isinstance(message, RateLimitEvent):
-                quota_error = _quota_error_from_rate_limit(message)
-                if quota_error is not None:
-                    await coordinator.set_status(agent_id, "stopped")
-                    raise quota_error
-                continue
-
-            final_output = await _apply_result_text(
-                message, coordinator=coordinator, agent_id=agent_id, final_output=final_output
-            )
-            turns_used = _log_turn_stage(
-                message,
-                turns_used=turns_used,
-                max_turns=max_turns,
-                is_root=is_root,
-                agent_id=agent_id,
-            )
-            await _apply_cost(
-                message,
-                coordinator=coordinator,
-                agent_id=agent_id,
-                is_root=is_root,
-                max_budget_usd=max_budget_usd,
-            )
-
-    await coordinator.set_status(agent_id, "completed")
-    return ClaudeCodeRunResult(final_output=final_output)
+                    prompt = await _await_next_input(
+                        coordinator=coordinator, agent_id=agent_id, is_root=is_root
+                    )
+                except asyncio.CancelledError:
+                    return result
+                if prompt is None:
+                    continue
+                with contextlib.suppress(BudgetPausedError):
+                    result, turns_used = await _run_until_lifecycle(
+                        client,
+                        prompt=prompt,
+                        coordinator=coordinator,
+                        agent_id=agent_id,
+                        is_root=is_root,
+                        interactive=True,
+                        max_turns=max_turns,
+                        max_budget_usd=max_budget_usd,
+                        event_sink=event_sink,
+                        turns_used=turns_used,
+                    )
+        # Only reachable if the client's __aexit__ swallowed an exception.
+        return result
+    finally:
+        _clear_scratch_cwd(agent_id)

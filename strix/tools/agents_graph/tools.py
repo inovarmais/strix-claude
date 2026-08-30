@@ -13,6 +13,7 @@ from typing import Any, Literal, get_args
 from agents import RunContextWrapper, function_tool
 
 from strix.core.agents import Status, coordinator_from_context
+from strix.core.execution import notify_parent_on_terminal
 from strix.core.hooks import LLM_TURN_KEY
 from strix.skills import validate_requested_skills
 
@@ -637,11 +638,6 @@ async def agent_finish(
 
     await coordinator.set_status(me, "completed")
     if not parent_notified:
-        # Deferred import: strix.core.execution now imports the Claude Code engine,
-        # which imports back into this module, so importing this at module scope
-        # would be circular. Notification is call-time only, so a local import is safe.
-        from strix.core.execution import notify_parent_on_terminal
-
         # Silence here would leave a parent waiting on a report that is never coming.
         await notify_parent_on_terminal(coordinator, me, "completed")
 
@@ -752,9 +748,6 @@ async def stop_agent(
     async with coordinator._lock:
         orphaned = [aid for aid in stopped if coordinator.parent_of.get(aid) not in (None, me)]
     if orphaned:
-        # Deferred import: see the matching note in agent_finish() above.
-        from strix.core.execution import notify_parent_on_terminal
-
         for aid in orphaned:
             await notify_parent_on_terminal(coordinator, aid, "stopped")
 
