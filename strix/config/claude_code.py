@@ -10,8 +10,10 @@ later task), reusing whatever account it is already logged into
 from __future__ import annotations
 
 import logging
+import re
 import shutil
 import subprocess
+from datetime import UTC, datetime, timedelta
 
 
 logger = logging.getLogger(__name__)
@@ -59,3 +61,62 @@ def cli_login_status() -> tuple[bool, str | None]:
     if any(marker in lowered for marker in _NOT_LOGGED_IN_MARKERS):
         return False, output.strip() or None
     return True, output.strip() or None
+
+
+class SubscriptionQuotaExceededError(RuntimeError):
+    """A Claude subscription's usage limit was hit mid-scan.
+
+    Carries a best-effort ``reset_at`` (UTC) parsed from the CLI's own
+    message, so callers can print it (default behavior) or sleep until it
+    (``--auto-resume``, see ``strix.core.runner``).
+    """
+
+    def __init__(self, raw_message: str, reset_at: datetime | None) -> None:
+        self.raw_message = raw_message
+        self.reset_at = reset_at
+        super().__init__(raw_message)
+
+
+_QUOTA_MARKERS = (
+    "usage limit reached",
+    "5-hour limit reached",
+    "5-hour limit resets",
+)
+
+_CLOCK_TIME_RE = re.compile(r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b", re.IGNORECASE)
+
+# Anthropic's session limit window; used when the message names no time we
+# can parse (e.g. "please try again later"). Best-effort only — a real reset
+# time from the message always takes precedence.
+_FALLBACK_QUOTA_WAIT = timedelta(hours=5)
+
+
+def _parse_reset_time(message: str) -> datetime | None:
+    match = _CLOCK_TIME_RE.search(message)
+    if not match:
+        return None
+    hour = int(match.group(1)) % 12
+    minute = int(match.group(2) or 0)
+    if match.group(3).lower() == "pm":
+        hour += 12
+    now = datetime.now(UTC)
+    candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if candidate <= now:
+        candidate += timedelta(days=1)
+    return candidate
+
+
+def classify_quota_error(message: str) -> SubscriptionQuotaExceededError | None:
+    """Return a ``SubscriptionQuotaExceededError`` if ``message`` looks like a
+    Claude subscription quota/usage-limit message, else None.
+
+    The CLI reports this as free text (there is no structured error code for
+    it as of this writing), so detection is substring-based on the phrasing
+    Anthropic currently uses. If Anthropic changes this phrasing, update
+    ``_QUOTA_MARKERS``.
+    """
+    lowered = message.lower()
+    if not any(marker in lowered for marker in _QUOTA_MARKERS):
+        return None
+    reset_at = _parse_reset_time(message) or (datetime.now(UTC) + _FALLBACK_QUOTA_WAIT)
+    return SubscriptionQuotaExceededError(message, reset_at)

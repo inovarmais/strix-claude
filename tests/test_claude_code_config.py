@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import subprocess
+from datetime import UTC, datetime, timedelta
 from unittest import mock
+
+import pytest
 
 from strix.config import claude_code
 
@@ -83,3 +86,38 @@ def test_cli_login_status_false_on_command_failure() -> None:
     ):
         logged_in, detail = claude_code.cli_login_status()
     assert (logged_in, detail) == (False, None)
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Claude AI usage limit reached, please try again after 3pm",
+        "5-hour limit reached - resets 7:30pm",
+        "5-hour limit resets 7pm - continuing with usage credits.",
+    ],
+)
+def test_classify_quota_error_detects_known_messages(message: str) -> None:
+    err = claude_code.classify_quota_error(message)
+    assert err is not None
+    assert err.raw_message == message
+
+
+def test_classify_quota_error_returns_none_for_unrelated_text() -> None:
+    assert claude_code.classify_quota_error("connection reset by peer") is None
+    assert claude_code.classify_quota_error("invalid API key") is None
+
+
+def test_classify_quota_error_parses_explicit_clock_time() -> None:
+    err = claude_code.classify_quota_error("5-hour limit reached - resets 11:45pm")
+    assert err is not None
+    assert err.reset_at is not None
+    assert err.reset_at.hour == 23
+    assert err.reset_at.minute == 45
+
+
+def test_classify_quota_error_falls_back_when_time_unparseable() -> None:
+    before = datetime.now(UTC)
+    err = claude_code.classify_quota_error("Claude AI usage limit reached, please try again later")
+    assert err is not None
+    assert err.reset_at is not None
+    assert err.reset_at >= before + claude_code._FALLBACK_QUOTA_WAIT - timedelta(seconds=5)
