@@ -38,10 +38,20 @@ def _tool_name(tool: Tool) -> str:
     return name
 
 
-def _schema_properties(tool: FunctionTool) -> dict[str, Any]:
-    schema = tool.params_json_schema or {}
-    properties = schema.get("properties")
-    return properties if isinstance(properties, dict) else {}
+def _input_schema(tool: FunctionTool) -> dict[str, Any]:
+    """The tool's full JSON schema, as ``claude_agent_sdk`` requires it.
+
+    ``claude_agent_sdk``'s ``_build_input_schema`` only passes a dict through
+    verbatim when it already has top-level ``type``/``properties`` keys;
+    otherwise it treats each value as a Python type and defaults every field
+    to ``{"type": "string"}``. ``params_json_schema`` already has both keys
+    (pydantic-generated), so it must be passed whole -- not just its
+    ``properties`` sub-dict.
+    """
+    schema = tool.params_json_schema
+    if isinstance(schema, dict) and "type" in schema and "properties" in schema:
+        return schema
+    return {"type": "object", "properties": {}}
 
 
 def _adapt_function_tool(tool: FunctionTool) -> SdkMcpTool[Any]:
@@ -64,7 +74,7 @@ def _adapt_function_tool(tool: FunctionTool) -> SdkMcpTool[Any]:
         text = output if isinstance(output, str) else json.dumps(output, ensure_ascii=False)
         return {"content": [{"type": "text", "text": text}]}
 
-    return sdk_tool(tool.name, tool.description or tool.name, _schema_properties(tool))(handler)
+    return sdk_tool(tool.name, tool.description or tool.name, _input_schema(tool))(handler)
 
 
 def _adapt_custom_tool(tool: CustomTool) -> SdkMcpTool[Any]:

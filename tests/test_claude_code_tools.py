@@ -25,6 +25,12 @@ async def echo(text: str) -> str:
     return f"echo: {text}"
 
 
+@function_tool
+async def count_items(items: list[str]) -> str:
+    """Count the given items."""
+    return f"count: {len(items)}"
+
+
 async def _call_tool(server: dict, name: str, arguments: dict) -> mcp_types.CallToolResult:
     handler = server["instance"].request_handlers[mcp_types.CallToolRequest]
     request = mcp_types.CallToolRequest(
@@ -33,6 +39,12 @@ async def _call_tool(server: dict, name: str, arguments: dict) -> mcp_types.Call
     )
     result = await handler(request)
     return result.root
+
+
+async def _list_tools(server: dict) -> dict[str, dict]:
+    handler = server["instance"].request_handlers[mcp_types.ListToolsRequest]
+    result = await handler(mcp_types.ListToolsRequest(method="tools/list"))
+    return {t.name: t.inputSchema for t in result.root.tools}
 
 
 def test_bridged_tool_names_uses_mcp_permission_format() -> None:
@@ -90,3 +102,22 @@ async def test_build_mcp_server_adapts_apply_patch_custom_tool_patch_field() -> 
 def test_build_mcp_server_rejects_unsupported_tool_type() -> None:
     with pytest.raises(TypeError):
         build_mcp_server([object()], name="strix")  # type: ignore[list-item]
+
+
+@pytest.mark.asyncio
+async def test_build_mcp_server_preserves_non_string_parameter_schema() -> None:
+    """A non-``str`` parameter must keep its real wire-level type, not degrade
+    to ``{"type": "string"}`` (which is also what ``claude_agent_sdk`` returns
+    for any type it fails to recognize, so a call-level assertion is needed
+    too -- a real ``list`` argument must actually validate and dispatch).
+    """
+    server = build_mcp_server([count_items], name="strix")
+
+    schemas = await _list_tools(server)
+    items_schema = schemas["count_items"]["properties"]["items"]
+    assert items_schema["type"] == "array"
+
+    result = await _call_tool(server, "count_items", {"items": ["a", "b", "c"]})
+
+    assert result.isError is False
+    assert result.content[0].text == "count: 3"
