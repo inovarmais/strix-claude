@@ -21,7 +21,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
 
-from strix.config import codex, load_settings
+from strix.config import claude_code, codex, load_settings
 
 
 if TYPE_CHECKING:
@@ -244,20 +244,44 @@ def _first(query: dict[str, list[str]], key: str) -> str | None:
 
 def _status(console: Console) -> int:
     record = codex.read_record()
+    settings = load_settings()
     if record is None:
         console.print("[yellow]Not signed in.[/] Run [cyan]strix auth login chatgpt[/] to sign in.")
-        return 1
-    settings = load_settings()
-    console.print("[green]Signed in[/] with a ChatGPT subscription.")
-    console.print(f"  Account: [bold]{record.get('account_id')}[/]")
-    if codex.subscription_model(settings.llm.model):
-        console.print(f"  Runs use the subscription (STRIX_LLM=[bold]{settings.llm.model}[/]).")
+    else:
+        console.print("[green]Signed in[/] with a ChatGPT subscription.")
+        console.print(f"  Account: [bold]{record.get('account_id')}[/]")
+        if codex.subscription_model(settings.llm.model):
+            console.print(f"  Runs use the subscription (STRIX_LLM=[bold]{settings.llm.model}[/]).")
+        else:
+            console.print(
+                "  [yellow]Note:[/] set [cyan]STRIX_LLM[/] to e.g. [cyan]chatgpt/gpt-5.4[/] "
+                "to run on the subscription."
+            )
+    console.print()
+    if claude_code.is_cli_available():
+        logged_in, detail = claude_code.cli_login_status()
+        if logged_in:
+            console.print("[green]claude CLI:[/] logged in.")
+            if detail:
+                console.print(f"  {detail.splitlines()[0]}")
+            if claude_code.engine_model(settings.llm.model):
+                console.print(
+                    f"  Runs use the Claude Code engine (STRIX_LLM=[bold]{settings.llm.model}[/])."
+                )
+            else:
+                console.print(
+                    "  [yellow]Note:[/] set [cyan]STRIX_LLM[/] to e.g. "
+                    "[cyan]claude-code/sonnet[/] to use it."
+                )
+        else:
+            console.print(
+                "[yellow]claude CLI:[/] installed but not logged in. Run [cyan]claude /login[/]."
+            )
     else:
         console.print(
-            "  [yellow]Note:[/] set [cyan]STRIX_LLM[/] to e.g. [cyan]chatgpt/gpt-5.4[/] "
-            "to run on the subscription."
+            "[dim]claude CLI: not installed.[/] Install it to use STRIX_LLM=claude-code/<model>."
         )
-    return 0
+    return 0 if record is not None else 1
 
 
 def _logout(console: Console) -> int:
