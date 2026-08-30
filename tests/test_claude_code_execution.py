@@ -311,3 +311,35 @@ async def test_run_returns_early_when_scan_budget_already_stopped() -> None:
             agent_id="agent-1",
             is_root=True,
         )
+
+
+@pytest.mark.asyncio
+async def test_run_agent_loop_dispatches_to_claude_code_engine() -> None:
+    from agents import RunConfig
+
+    from strix.core.execution import run_agent_loop
+
+    coordinator = mock.AsyncMock()
+    coordinator.budget_stopped = False
+    coordinator.reserve_stopped = False
+    fake_agent = mock.MagicMock()
+    fake_agent.instructions = "you are a test agent"
+    fake_agent.tools = []
+
+    with mock.patch(
+        "strix.core.execution.run_claude_code_agent_loop",
+        new=mock.AsyncMock(return_value="sentinel-result"),
+    ) as bridged:
+        result = await run_agent_loop(
+            agent=fake_agent,
+            initial_input="do the thing",
+            run_config=RunConfig(model="claude-code/sonnet"),
+            context={"parent_id": None},
+            max_turns=5,
+            coordinator=coordinator,
+            agent_id="agent-1",
+            interactive=False,
+        )
+
+    bridged.assert_awaited_once()
+    assert result == "sentinel-result"

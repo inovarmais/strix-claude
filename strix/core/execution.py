@@ -19,7 +19,8 @@ from openai import (
     APITimeoutError,
 )
 
-from strix.config import codex
+from strix.config import claude_code, codex
+from strix.core.claude_code_execution import run_claude_code_agent_loop
 from strix.core.hooks import (
     BudgetExceededError,
     BudgetPausedError,
@@ -45,6 +46,7 @@ if TYPE_CHECKING:
     from agents.result import RunResultBase
 
     from strix.core.agents import AgentCoordinator, Status
+    from strix.core.claude_code_execution import ClaudeCodeRunResult
 
 
 logger = logging.getLogger(__name__)
@@ -85,7 +87,9 @@ def _structured_provider_refusal(result: Any) -> str | None:
     return None
 
 
-def _run_config_model(run_config: RunConfig) -> str | None:
+def _run_config_model(run_config: RunConfig | None) -> str | None:
+    if run_config is None:
+        return None
     return run_config.model if isinstance(run_config.model, str) else None
 
 
@@ -184,6 +188,61 @@ async def _seed_and_prepare_first_input(
 
 
 async def run_agent_loop(
+    *,
+    agent: Any,
+    initial_input: Any,
+    run_config: RunConfig,
+    context: dict[str, Any],
+    max_turns: int,
+    coordinator: AgentCoordinator,
+    agent_id: str,
+    interactive: bool,
+    session: Session | None = None,
+    start_parked: bool = False,
+    event_sink: StreamEventSink | None = None,
+    hooks: RunHooks[dict[str, Any]] | None = None,
+) -> RunResultBase | ClaudeCodeRunResult | None:
+    """Dispatch one agent's turn loop to the model's engine.
+
+    A ``claude-code/<model>`` ``STRIX_LLM`` routes to the Claude Code engine
+    (the real ``claude`` CLI); every other model keeps using the
+    OpenAI-Agents-SDK loop in ``_run_agent_loop_default_engine``. Kept as a
+    thin wrapper rather than a branch inside that loop so the two engines'
+    control flow stays fully separate.
+    """
+    model_slug = claude_code.engine_model(_run_config_model(run_config))
+    if model_slug is not None:
+        is_root = context.get("parent_id") is None
+        return await run_claude_code_agent_loop(
+            tools=list(getattr(agent, "tools", []) or []),
+            instructions=_agent_instructions(agent),
+            model_slug=model_slug,
+            initial_input=str(initial_input),
+            max_turns=max_turns,
+            max_budget_usd=context.get("max_budget_usd"),
+            coordinator=coordinator,
+            agent_id=agent_id,
+            is_root=is_root,
+            event_sink=event_sink,
+        )
+
+    return await _run_agent_loop_default_engine(
+        agent=agent,
+        initial_input=initial_input,
+        run_config=run_config,
+        context=context,
+        max_turns=max_turns,
+        coordinator=coordinator,
+        agent_id=agent_id,
+        interactive=interactive,
+        session=session,
+        start_parked=start_parked,
+        event_sink=event_sink,
+        hooks=hooks,
+    )
+
+
+async def _run_agent_loop_default_engine(
     *,
     agent: Any,
     initial_input: Any,

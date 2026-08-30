@@ -56,6 +56,7 @@ if TYPE_CHECKING:
     from agents.memory import SQLiteSession
     from agents.result import RunResultBase
 
+    from strix.core.claude_code_execution import ClaudeCodeRunResult
     from strix.runtime.status import StatusSink
     from strix.tools.mcp import (
         ConnectedMcpServer,
@@ -198,7 +199,7 @@ async def run_strix_scan(
     status_sink: StatusSink | None = None,
     mcp_connection_requests: list[McpConnectionRequest] | None = None,
     mcp_status_sink: McpStatusSink | None = None,
-) -> RunResultBase | None:
+) -> RunResultBase | ClaudeCodeRunResult | None:
     """Run or resume one Strix scan against a sandbox.
 
     ``root_instructions_override`` adds root scan instructions to the rendered
@@ -525,6 +526,7 @@ async def run_strix_scan(
             "spawn_child_agent": spawn_child_agent,
             "scan_targets": build_scan_targets(scan_config),
             "max_context_images": settings.runtime.max_context_images,
+            "max_budget_usd": max_budget_usd,
         }
 
         root_session = open_agent_session(root_id, agents_db)
