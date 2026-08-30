@@ -69,14 +69,17 @@ def test_cli_login_status_false_on_not_logged_in_marker() -> None:
         mock.patch("shutil.which", return_value="/usr/local/bin/claude"),
         mock.patch("subprocess.run", return_value=completed),
     ):
-        logged_in, detail = claude_code.cli_login_status()
+        logged_in, _detail = claude_code.cli_login_status()
     assert logged_in is False
 
 
 def test_cli_login_status_false_on_command_failure() -> None:
     with (
         mock.patch("shutil.which", return_value="/usr/local/bin/claude"),
-        mock.patch("subprocess.run", side_effect=subprocess.TimeoutExpired(cmd="claude", timeout=10)),
+        mock.patch(
+            "subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd="claude", timeout=10),
+        ),
     ):
         logged_in, detail = claude_code.cli_login_status()
     assert (logged_in, detail) == (False, None)

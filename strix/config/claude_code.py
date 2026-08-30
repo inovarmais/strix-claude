@@ -2,8 +2,9 @@
 
 Unlike ``strix.config.codex``, this module manages no credentials of its
 own: ``STRIX_LLM=claude-code/<model>`` drives the agent's turn loop via the
-real ``claude`` CLI (see ``strix.core.claude_code_execution``), reusing
-whatever account it is already logged into (``claude /login``).
+real ``claude`` CLI (see ``strix.core.claude_code_execution``, added in a
+later task), reusing whatever account it is already logged into
+(``claude /login``).
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ from __future__ import annotations
 import logging
 import shutil
 import subprocess
+
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +45,7 @@ def cli_login_status() -> tuple[bool, str | None]:
         return False, None
     try:
         result = subprocess.run(
-            ["claude", "auth", "status"],
+            ["claude", "auth", "status"],  # noqa: S607
             capture_output=True,
             text=True,
             timeout=_STATUS_TIMEOUT_S,
