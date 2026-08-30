@@ -33,8 +33,12 @@ This is opt-in per run, not a replacement of the default engine.
   The graph stays engine-agnostic; only the per-agent reasoning loop is pluggable.
 - No mixed engines within one run: a child spawned by a Claude-Code-driven agent
   inherits the parent's engine.
-- Claude Code's native `Bash`/`Read`/`Write`/`WebSearch` tools are not used. Every
-  side effect continues to go through Strix's own tools.
+- Claude Code's native `Bash`/`Read`/`Write`/`WebSearch` tools are available to
+  the agent as auxiliary research/reasoning aids (e.g. looking up a CVE, drafting
+  or dry-running a PoC snippet, reading local skill docs) — but are never given
+  access to the scan's sandboxed workspace or target. See "Native tool scoping"
+  below. Every side effect against the target — filesystem, shell, HTTP — still
+  goes only through Strix's own bridged tools.
 
 ## Architecture
 
@@ -60,13 +64,37 @@ Every tool Strix already registers for an agent (`strix/agents/factory.py:
 _BASE_TOOLS`, plus proxy/reporting/coverage/threat-model/agents-graph/shell/
 filesystem tools) is wrapped a second way: with `claude_agent_sdk`'s `@tool`
 decorator, registered into an in-process MCP server via
-`create_sdk_mcp_server`, and passed to `ClaudeAgentOptions(mcp_servers=...,
-allowed_tools=[...])`. `allowed_tools` is set to exactly Strix's tool set —
-Claude Code's own built-in tools are excluded — so the underlying
-implementation functions are unchanged; only their SDK-facing wrapper differs
-per engine. This keeps sandboxing, output-bounding (`bound_and_store`), and
-argument coercion identical across engines, since both wrappers call the same
-inner function.
+`create_sdk_mcp_server`, and passed to `ClaudeAgentOptions(mcp_servers=...)`
+alongside Claude Code's own native tools (see "Native tool scoping" below) —
+the underlying implementation functions are unchanged; only their SDK-facing
+wrapper differs per engine. This keeps sandboxing, output-bounding
+(`bound_and_store`), and argument coercion identical across engines, since
+both wrappers call the same inner function.
+
+### Native tool scoping
+
+Claude Code's native `WebSearch`/`Bash`/`Read`/`Write` tools stay enabled
+(not excluded via `allowed_tools`), for the agent's own auxiliary
+reasoning — but are kept structurally unable to reach the scan target or
+its sandboxed workspace, so no containerized-transport work is needed:
+
+- The `claude` CLI subprocess (spawned locally by `claude-agent-sdk`, its
+  default behavior) runs with `cwd` set to a scratch directory that is
+  **not** the bind-mounted `/workspace` the Docker sandbox uses. Native
+  `Read`/`Write` therefore cannot see or modify target source, findings,
+  or run artifacts.
+- Native `Bash` runs on the host process, outside the Docker sandbox
+  network entirely — it has no path to the target and is not proxied
+  through Caido. It's usable for local scratch work (e.g. testing a regex,
+  formatting data) but never for anything that touches the target.
+- Native `WebSearch` queries Anthropic's own search backend, not the
+  target, so it carries no sandbox concern; Strix's own `web_search` tool
+  remains available too.
+- Everything that must touch the target — shell exec, file access under
+  `/workspace`, HTTP to/through the target — is only reachable via Strix's
+  MCP-bridged tools (`exec_command`, filesystem-via-sandbox, proxy tools),
+  exactly as in the original design. The sandbox boundary is therefore
+  preserved without running the `claude` CLI process inside the container.
 
 ### Sandbox, reporting, multi-agent graph
 
@@ -146,7 +174,9 @@ credential of Strix's own to validate.
 - Exact shape of the quota/rate-limit error the SDK surfaces (message
   format, reset-time field) — verify against the SDK's actual error types
   before implementing the classifier.
-- Whether the sandbox image needs the `claude` CLI preinstalled, or whether
-  `ClaudeCodeEngine` should run outside the container and only route tool
-  calls into it (current tools already do this for the default engine, so
-  likely no image change is needed — confirm during planning).
+- The `claude` CLI runs on the host (outside `containers/Dockerfile`'s
+  image); only Strix's bridged tools reach into the sandbox, as today. No
+  sandbox image change is expected for this feature.
+- A scratch `cwd` for the native-tools process needs a concrete location
+  and cleanup policy (e.g. under `strix/core/paths.py`'s run directory but
+  outside `/workspace`) — pick this during planning.
