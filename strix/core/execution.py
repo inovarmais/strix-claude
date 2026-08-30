@@ -268,7 +268,11 @@ async def run_agent_loop(
             ],
             instructions=_agent_instructions(agent),
             model_slug=model_slug,
-            initial_input=str(initial_input),
+            # Passed through unstringified: it is a task string on a fresh run,
+            # a ``child_initial_input`` message list for a spawned sub-agent,
+            # and ``[]`` on resume/respawn. The engine normalizes all three --
+            # ``str()`` here turned the last two into "[]" and a Python repr.
+            initial_input=initial_input,
             max_turns=max_turns,
             max_budget_usd=context.get("max_budget_usd"),
             context=context,

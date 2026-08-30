@@ -19,7 +19,7 @@ from strix.agents.factory import _custom_tool_as_function_tool
 
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
 
     from agents.tool import Tool
     from claude_agent_sdk import McpSdkServerConfig, SdkMcpTool
@@ -54,7 +54,11 @@ def _input_schema(tool: FunctionTool) -> dict[str, Any]:
     return {"type": "object", "properties": {}}
 
 
-def _adapt_function_tool(tool: FunctionTool, context: dict[str, Any]) -> SdkMcpTool[Any]:
+def _adapt_function_tool(
+    tool: FunctionTool,
+    context: dict[str, Any],
+    on_result: Callable[[str, str], None] | None = None,
+) -> SdkMcpTool[Any]:
     """Wrap an ``agents.tool.FunctionTool`` as an ``SdkMcpTool``.
 
     Reuses ``tool.on_invoke_tool`` verbatim (already bounded/coerced by
@@ -64,6 +68,10 @@ def _adapt_function_tool(tool: FunctionTool, context: dict[str, Any]) -> SdkMcpT
     every context-dependent tool reads its dependencies from (the agent
     coordinator, the Caido client, the MCP registry, ...). Without it those
     tools all fail with "not initialized in context".
+
+    ``on_result`` (name, result-text) lets the caller observe what each bridged
+    tool returned -- the Claude Code engine uses it to keep a lifecycle tool's
+    JSON, which the CLI's own closing prose would otherwise hide.
     """
 
     async def handler(args: dict[str, Any]) -> dict[str, Any]:
@@ -76,12 +84,18 @@ def _adapt_function_tool(tool: FunctionTool, context: dict[str, Any]) -> SdkMcpT
         )
         output = await tool.on_invoke_tool(ctx, raw_input)
         text = output if isinstance(output, str) else json.dumps(output, ensure_ascii=False)
+        if on_result is not None:
+            on_result(tool.name, text)
         return {"content": [{"type": "text", "text": text}]}
 
     return sdk_tool(tool.name, tool.description or tool.name, _input_schema(tool))(handler)
 
 
-def _adapt_custom_tool(tool: CustomTool, context: dict[str, Any]) -> SdkMcpTool[Any]:
+def _adapt_custom_tool(
+    tool: CustomTool,
+    context: dict[str, Any],
+    on_result: Callable[[str, str], None] | None = None,
+) -> SdkMcpTool[Any]:
     """Wrap a native ``CustomTool`` (e.g. ``apply_patch``) as an ``SdkMcpTool``.
 
     Delegates to ``strix.agents.factory``'s existing Responses-custom-tool ->
@@ -90,23 +104,28 @@ def _adapt_custom_tool(tool: CustomTool, context: dict[str, Any]) -> SdkMcpTool[
     ``input`` otherwise) and error-as-result handling stay identical to the
     default engine instead of being reimplemented here.
     """
-    return _adapt_function_tool(_custom_tool_as_function_tool(tool), context)
+    return _adapt_function_tool(_custom_tool_as_function_tool(tool), context, on_result)
 
 
 def build_mcp_server(
-    tools: Sequence[Tool], *, context: dict[str, Any], name: str = "strix"
+    tools: Sequence[Tool],
+    *,
+    context: dict[str, Any],
+    name: str = "strix",
+    on_result: Callable[[str, str], None] | None = None,
 ) -> McpSdkServerConfig:
     """An in-process MCP server exposing ``tools`` to a Claude Agent SDK session.
 
     ``context`` is the agent's run context and is required: it is what the
-    bridged tools reach their per-run dependencies through.
+    bridged tools reach their per-run dependencies through. ``on_result`` is an
+    optional (tool name, result text) observer, called for every bridged call.
     """
     adapted = []
     for t in tools:
         if isinstance(t, FunctionTool):
-            adapted.append(_adapt_function_tool(t, context))
+            adapted.append(_adapt_function_tool(t, context, on_result))
         elif isinstance(t, CustomTool):
-            adapted.append(_adapt_custom_tool(t, context))
+            adapted.append(_adapt_custom_tool(t, context, on_result))
         else:
             msg = f"unsupported tool type for claude-code bridging: {type(t)!r}"
             raise TypeError(msg)

@@ -12,6 +12,7 @@ its shape. ``ResultMessage``-shaped fields are read via a plain fake dataclass
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -19,9 +20,10 @@ from typing import Any, Self
 from unittest import mock
 
 import pytest
-from agents import RunConfig
+from agents import RunConfig, function_tool
 from agents.exceptions import MaxTurnsExceeded
 from claude_agent_sdk import RateLimitEvent, RateLimitInfo
+from mcp import types as mcp_types
 
 from strix.config.claude_code import SubscriptionQuotaExceededError
 from strix.core import claude_code_execution
@@ -30,14 +32,61 @@ from strix.core.claude_code_execution import (
     ClaudeCodeRunResult,
     _build_options,
     _scratch_path_guard,
+    _tool_name_rewriter,
     run_claude_code_agent_loop,
 )
-from strix.core.execution import run_agent_loop
+from strix.core.execution import run_agent_loop, tool_required_message
 from strix.core.hooks import (
     BudgetExceededError,
     ReportUsageHooks,
     SubagentBudgetReservedError,
 )
+from strix.core.inputs import child_initial_input
+
+
+@function_tool
+async def finish_scan(summary: str) -> str:
+    """Finish the scan."""
+    return json.dumps({"success": True, "scan_completed": True, "summary": summary})
+
+
+@function_tool
+async def agent_finish(summary: str) -> str:
+    """Finish this sub-agent's task."""
+    return json.dumps({"success": True, "task_completed": True, "summary": summary})
+
+
+@function_tool
+async def respond_to_user(message: str) -> str:
+    """Say something to the user and park."""
+    return json.dumps({"success": True, "message": message})
+
+
+@function_tool
+async def wait_for_agents(agent_ids: list[str]) -> str:
+    """Wait for other agents."""
+    return json.dumps({"success": True, "wait_outcome": "waiting", "agent_ids": agent_ids})
+
+
+@function_tool
+async def think(thought: str) -> str:
+    """Think out loud."""
+    return thought
+
+
+_LIFECYCLE_TOOLS = [finish_scan, agent_finish, respond_to_user, wait_for_agents, think]
+
+
+async def _call_bridged_tool(server: dict, name: str, arguments: dict) -> Any:
+    """Dispatch a real ``tools/call`` at the in-process MCP server, as the CLI does."""
+    handler = server["instance"].request_handlers[mcp_types.CallToolRequest]
+    result = await handler(
+        mcp_types.CallToolRequest(
+            method="tools/call",
+            params=mcp_types.CallToolRequestParams(name=name, arguments=arguments),
+        )
+    )
+    return result.root
 
 
 @dataclass
@@ -96,6 +145,7 @@ class _FakeCoordinator:
     idle_resume_counts: dict[str, int] = field(default_factory=dict)
     parent_of: dict[str, str | None] = field(default_factory=dict)
     names: dict[str, str] = field(default_factory=dict)
+    metadata: dict[str, dict[str, Any]] = field(default_factory=dict)
     errors: dict[str, str] = field(default_factory=dict)
     runtimes: dict[str, Any] = field(default_factory=dict)
     wait_kinds: dict[str, str] = field(default_factory=dict)
@@ -187,9 +237,7 @@ def _settles(coordinator: Any, status: str = "completed", agent_id: str = "agent
 
 
 def _patch_client(monkeypatch: pytest.MonkeyPatch, client: _FakeClient) -> None:
-    monkeypatch.setattr(
-        "strix.core.claude_code_execution._open_client", lambda **_kwargs: client
-    )
+    monkeypatch.setattr("strix.core.claude_code_execution._open_client", lambda **_kwargs: client)
 
 
 def _patch_report_state(monkeypatch: pytest.MonkeyPatch, report_state: Any) -> None:
@@ -608,3 +656,393 @@ async def test_run_agent_loop_dispatches_to_claude_code_engine() -> None:
     assert kwargs["max_budget_usd"] == 12.5
     assert kwargs["context"] is context
     assert kwargs["is_root"] is True
+
+
+# --------------------------------------------------------------------------
+# N1: the shapes ``run_agent_loop`` actually hands this engine.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "initial_input",
+    [
+        # `strix --resume` / every `--auto-resume` retry (runner.py sets
+        # `initial_input = [] if is_resume else root_task`), and
+        # `respawn_subagents` restarting a child -- both pass `[]`.
+        [],
+        # A spawned sub-agent's task, from `child_initial_input`.
+        [{"role": "user", "content": "You are agent Recon (c1). Map the API surface."}],
+    ],
+)
+async def test_run_agent_loop_forwards_non_string_initial_input_unstringified(
+    initial_input: Any,
+) -> None:
+    """``str(initial_input)`` used to turn these into ``"[]"`` and a Python repr.
+
+    This is the real dispatch path ``runner.py`` calls, so it pins the fix at the
+    point the resume / auto-resume / respawn flows actually reach.
+    """
+    coordinator = mock.AsyncMock()
+    coordinator.budget_stopped = False
+    coordinator.reserve_stopped = False
+    fake_agent = mock.MagicMock()
+    fake_agent.instructions = "you are a test agent"
+    fake_agent.tools = []
+    fake_agent.capabilities = []
+
+    with mock.patch(
+        "strix.core.claude_code_execution.run_claude_code_agent_loop",
+        new=mock.AsyncMock(return_value=None),
+    ) as bridged:
+        await run_agent_loop(
+            agent=fake_agent,
+            initial_input=initial_input,
+            run_config=RunConfig(model="claude-code/sonnet"),
+            context={"parent_id": None, "coordinator": coordinator},
+            max_turns=5,
+            coordinator=coordinator,
+            agent_id="agent-1",
+            interactive=False,
+        )
+
+    assert bridged.await_args.kwargs["initial_input"] == initial_input
+
+
+@pytest.mark.asyncio
+async def test_plain_string_task_is_sent_to_the_cli_verbatim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coordinator = _coordinator()
+    client = _FakeClient(
+        [_FakeResultMessage(is_error=False, result="ok", total_cost_usd=None)],
+        on_turn_end=_settles(coordinator),
+    )
+    _patch_client(monkeypatch, client)
+    _patch_report_state(monkeypatch, None)
+
+    await _run(coordinator)
+
+    assert client.prompts == ["do the thing"]
+
+
+@pytest.mark.asyncio
+async def test_empty_resume_input_becomes_a_real_resume_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A resumed root used to be handed the literal string ``"[]"``."""
+    coordinator = _coordinator()
+    coordinator.metadata["agent-1"] = {"task": "Pentest https://example.com"}
+    # `strix --resume --instruction ...` queues the new instruction on root.
+    coordinator.mailbox.append({"from": "user", "content": "focus on auth this time"})
+    client = _FakeClient(
+        [_FakeResultMessage(is_error=False, result="ok", total_cost_usd=None)],
+        on_turn_end=_settles(coordinator),
+    )
+    _patch_client(monkeypatch, client)
+    _patch_report_state(monkeypatch, None)
+
+    await _run(coordinator, initial_input=[])
+
+    prompt = client.prompts[0]
+    assert prompt != "[]"
+    assert "resuming an interrupted Strix scan" in prompt
+    assert "Pentest https://example.com" in prompt
+    assert "focus on auth this time" in prompt
+
+
+@pytest.mark.asyncio
+async def test_subagent_message_list_input_is_unwrapped_not_repr_dumped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coordinator = _coordinator()
+    client = _FakeClient(
+        [_FakeResultMessage(is_error=False, result="ok", total_cost_usd=None)],
+        on_turn_end=_settles(coordinator),
+    )
+    _patch_client(monkeypatch, client)
+    _patch_report_state(monkeypatch, None)
+
+    initial = child_initial_input(
+        name="Recon",
+        child_id="c1",
+        parent_id="p1",
+        task="Map the API surface of /v2.",
+        parent_history=[],
+    )
+    await _run(coordinator, initial_input=initial, is_root=False)
+
+    prompt = client.prompts[0]
+    assert prompt.startswith("You are agent Recon (c1)")
+    assert "Map the API surface of /v2." in prompt
+    # The old `str(list_of_dicts)` repr leaked these.
+    assert "'role'" not in prompt
+    assert "[{" not in prompt
+
+
+# --------------------------------------------------------------------------
+# N2: error containment in the engine's turn loop.
+# --------------------------------------------------------------------------
+
+
+class _ExplodingClient(_FakeClient):
+    async def query(self, prompt: str, session_id: str = "default") -> None:  # noqa: ARG002
+        raise RuntimeError("CLI transport died")
+
+
+@pytest.mark.asyncio
+async def test_unexpected_error_crashes_the_agent_and_notifies_its_parent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without containment a sub-agent sat at "running" forever and its parent
+    burned its whole wait timeout on a report that was never coming."""
+    coordinator = _coordinator()
+    coordinator.parent_of["agent-1"] = "root-1"
+    coordinator.names["agent-1"] = "Recon"
+    _patch_client(monkeypatch, _ExplodingClient([]))
+    _patch_report_state(monkeypatch, None)
+
+    with pytest.raises(RuntimeError, match="CLI transport died"):
+        await _run(coordinator, is_root=False)
+
+    assert coordinator.statuses["agent-1"] == "crashed"
+    assert [m["type"] for m in coordinator.sent] == ["crashed"]
+    assert "Recon" in coordinator.sent[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_interactive_unexpected_error_parks_the_agent_as_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Parity with ``_run_cycle_parked``: an interactive run stays resumable
+    instead of taking the whole loop down."""
+    coordinator = _coordinator()
+    _patch_client(monkeypatch, _ExplodingClient([]))
+    _patch_report_state(monkeypatch, None)
+
+    result = await _run(coordinator, interactive=True)
+
+    assert result is None
+    assert coordinator.statuses["agent-1"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_containment_does_not_swallow_already_settled_stops(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A budget/quota stop settles its own status; containment must leave it
+    alone rather than relabelling a clean stop as a crash."""
+    coordinator = _coordinator()
+    final = _FakeResultMessage(
+        is_error=True, result="5-hour limit reached - resets 7pm", total_cost_usd=None
+    )
+    _patch_client(monkeypatch, _FakeClient([final]))
+    _patch_report_state(monkeypatch, None)
+
+    with pytest.raises(SubscriptionQuotaExceededError):
+        await _run(coordinator, interactive=True)
+
+    assert coordinator.statuses["agent-1"] == "stopped"
+
+
+# --------------------------------------------------------------------------
+# N3: final_output carries the lifecycle tool's JSON, not the closing prose.
+# --------------------------------------------------------------------------
+
+
+def _runner_scan_completed(final: Any) -> bool:
+    """``strix.core.runner``'s completion check, verbatim."""
+    if isinstance(final, str):
+        try:
+            parsed = json.loads(final)
+        except (ValueError, TypeError):
+            return False
+        return bool(isinstance(parsed, dict) and parsed.get("scan_completed"))
+    if isinstance(final, dict):
+        return bool(final.get("scan_completed"))
+    return False
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_tool_result_is_recorded_by_the_bridged_mcp_server() -> None:
+    """The recorder is wired through the real in-process MCP server, so the
+    JSON is captured exactly where the CLI actually calls the tool."""
+    lifecycle: dict[str, str] = {}
+    options = _build_options(
+        tools=[think, finish_scan],
+        instructions="be careful",
+        model_slug="sonnet",
+        max_turns=5,
+        agent_id="agent-rec",
+        context={"parent_id": None},
+        lifecycle_output=lifecycle,
+    )
+    server = options.mcp_servers["strix"]
+
+    await _call_bridged_tool(server, "think", {"thought": "hmm"})
+    assert lifecycle == {}, "a non-lifecycle tool must not claim final_output"
+
+    await _call_bridged_tool(server, "finish_scan", {"summary": "3 findings"})
+    assert _runner_scan_completed(lifecycle["last"])
+
+    claude_code_execution._clear_scratch_cwd("agent-rec")
+
+
+@pytest.mark.asyncio
+async def test_final_output_prefers_the_lifecycle_json_over_the_closing_prose(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``ResultMessage.result`` is the model's closing prose, which never parses
+    as the finish_scan shape -- so every successful claude-code scan used to log
+    "ended without calling finish_scan"."""
+    coordinator = _coordinator()
+    captured: dict[str, Any] = {}
+    real_build = claude_code_execution._build_options
+
+    def _capture(**kwargs: Any) -> Any:
+        captured["lifecycle_output"] = kwargs["lifecycle_output"]
+        return real_build(**kwargs)
+
+    monkeypatch.setattr(claude_code_execution, "_build_options", _capture)
+
+    def _on_turn_end(_turn: int) -> None:
+        captured["lifecycle_output"]["last"] = '{"success": true, "scan_completed": true}'
+        coordinator.statuses["agent-1"] = "completed"
+
+    _patch_client(
+        monkeypatch,
+        _FakeClient(
+            [
+                _FakeResultMessage(
+                    is_error=False,
+                    result="All done! I found 3 issues and wrote the report.",
+                    total_cost_usd=None,
+                )
+            ],
+            on_turn_end=_on_turn_end,
+        ),
+    )
+    _patch_report_state(monkeypatch, None)
+
+    result = await _run(coordinator)
+
+    assert isinstance(result, ClaudeCodeRunResult)
+    assert _runner_scan_completed(result.final_output)
+
+
+@pytest.mark.asyncio
+async def test_final_output_stays_prose_when_no_lifecycle_tool_was_called(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The completion signal stays meaningful: a scan that really never called a
+    lifecycle tool still fails runner.py's check."""
+    coordinator = _coordinator()
+    _patch_client(
+        monkeypatch,
+        _FakeClient(
+            [_FakeResultMessage(is_error=False, result="I think that's it.", total_cost_usd=None)],
+            # `wait_for_agents` settles the status without completing the scan.
+            on_turn_end=_settles(coordinator, "waiting"),
+        ),
+    )
+    _patch_report_state(monkeypatch, None)
+
+    result = await _run(coordinator)
+
+    assert isinstance(result, ClaudeCodeRunResult)
+    assert result.final_output == "I think that's it."
+    assert not _runner_scan_completed(result.final_output)
+
+
+# --------------------------------------------------------------------------
+# N4: bare tool names are rewritten on this engine's send path only.
+# --------------------------------------------------------------------------
+
+
+def test_tool_name_rewriter_prefixes_known_bridged_names() -> None:
+    rewrite = _tool_name_rewriter(_LIFECYCLE_TOOLS)
+    text = (
+        "If you have something to tell the user, call respond_to_user. "
+        "If you are blocked, call wait_for_agents. "
+        "When the engagement is done call finish_scan; a sub-agent calls agent_finish. "
+        "mcp__strix__finish_scan is already correct. "
+        "Take a moment to think about it first."
+    )
+
+    out = rewrite(text)
+
+    for name in ("respond_to_user", "wait_for_agents", "finish_scan", "agent_finish"):
+        assert f"mcp__strix__{name}" in out
+    # Never double-prefixed, and an already-prefixed mention is left alone.
+    assert "mcp__strix__mcp__strix__" not in out
+    assert out.count("mcp__strix__finish_scan") == 2
+    # Single-word tool names are also ordinary English words: rewriting them
+    # would corrupt prose, so `_TOOL_NAMING_NOTE` covers those instead.
+    assert "think about it" in out
+
+
+@pytest.mark.asyncio
+async def test_every_prompt_sent_to_the_cli_uses_bridged_tool_names(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Covers all three send paths: the initial input, the lifecycle nudge (which
+    names respond_to_user / wait_for_agents), and a mailbox message."""
+    coordinator = _coordinator()
+
+    def _on_turn_end(turn: int) -> None:
+        if turn >= 2:
+            coordinator.statuses["agent-1"] = "completed"
+
+    client = _FakeClient(
+        [_FakeResultMessage(is_error=False, result="prose", total_cost_usd=None)],
+        on_turn_end=_on_turn_end,
+    )
+    _patch_client(monkeypatch, client)
+    _patch_report_state(monkeypatch, None)
+
+    # Interactive so the nudge is the interactive one, which is the wording that
+    # names respond_to_user and wait_for_agents; that loop only ends when the
+    # scan tears the agent down, so run it until it parks and then stop it.
+    task = asyncio.create_task(
+        _run(
+            coordinator,
+            tools=_LIFECYCLE_TOOLS,
+            initial_input="Start by calling think, then finish_scan when done.",
+            interactive=True,
+        )
+    )
+    await asyncio.sleep(0.05)
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+    assert "mcp__strix__finish_scan" in client.prompts[0]
+    nudge = client.prompts[1]
+    for name in ("respond_to_user", "wait_for_agents", "finish_scan"):
+        assert f"mcp__strix__{name}" in nudge
+    assert "mcp__strix__mcp__strix__" not in nudge
+
+    claude_code_execution._clear_scratch_cwd("agent-1")
+
+
+def test_shared_system_prompt_is_rewritten_only_on_the_claude_code_engine() -> None:
+    """The jinja template is shared with the default engine, so it must stay
+    bare-named there and be transformed on the way into the CLI here."""
+    options = _build_options(
+        tools=_LIFECYCLE_TOOLS,
+        instructions="When the engagement is complete, call finish_scan.",
+        model_slug="sonnet",
+        max_turns=5,
+        agent_id="agent-sysprompt",
+        context={"parent_id": None},
+    )
+    assert "call mcp__strix__finish_scan." in str(options.system_prompt)
+
+    # The default engine's own nudge builder is untouched: bare names are
+    # correct there and prefixing them would break it.
+    default_nudge = tool_required_message(
+        finish_tool="finish_scan", attempt=1, limit=3, interactive=True
+    )
+    assert "mcp__strix__" not in default_nudge
+    assert "call respond_to_user" in default_nudge
+
+    claude_code_execution._clear_scratch_cwd("agent-sysprompt")

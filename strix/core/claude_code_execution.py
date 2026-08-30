@@ -52,7 +52,11 @@ Known differences, none of which change a scan's outcome:
   CLI's own responsibility on this engine, not Strix's.
 - ``strix --resume`` restores the run's Strix state (agents, findings, queued
   messages) but starts a fresh CLI conversation; the default engine replays its
-  SDK session instead.
+  SDK session instead. The fresh conversation opens with an explicit resume
+  prompt (``_first_prompt``) carrying the agent's registered task and its queued
+  messages, so it knows what it is resuming -- but the turn-by-turn history of
+  the interrupted run is genuinely gone, and the agent has to rebuild context
+  from the scan's persisted state (notes, todos, coverage, findings).
 
 Quota-exceeded detection has two layers:
 
@@ -74,14 +78,16 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import re
 import shutil
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from tempfile import gettempdir
 from typing import TYPE_CHECKING, Any
 
+from agents.exceptions import MaxTurnsExceeded
 from claude_agent_sdk import (
     ClaudeAgentOptions,
     ClaudeSDKClient,
@@ -103,6 +109,7 @@ from strix.core.execution import (
     _notify_parent_on_stall,
     _plain_waiting_timeout,
     _reserve_notice,
+    notify_parent_on_terminal,
     tool_required_message,
 )
 from strix.core.hooks import (
@@ -129,7 +136,7 @@ if TYPE_CHECKING:
     from agents.memory import Session
     from agents.tool import Tool
 
-    from strix.core.agents import AgentCoordinator
+    from strix.core.agents import AgentCoordinator, Status
 
 logger = logging.getLogger(__name__)
 
@@ -152,6 +159,23 @@ these instructions name a tool without that prefix, add it: the unprefixed name
 does not exist and calling it fails.
 """
 
+# Whose JSON result stands in for the CLI's closing prose as ``final_output``,
+# so ``strix.core.runner``'s completion check sees the same shape the default
+# engine's ``_finish_tool_use_behavior`` forces.
+_LIFECYCLE_FINISH_TOOLS = frozenset({"finish_scan", "agent_finish"})
+
+# Sent to a root/sub-agent whose ``initial_input`` is empty -- ``strix --resume``,
+# ``--auto-resume`` and sub-agent respawn all pass ``[]``, because the default
+# engine replays its persisted SDK session instead. This engine starts a fresh
+# CLI conversation, so it says what is being resumed rather than sending nothing.
+_RESUME_PROMPT = (
+    "You are resuming an interrupted Strix scan. This is a fresh conversation: none of "
+    "your previous turn-by-turn history is available here, only the scan's persisted "
+    "state. Before doing anything else, re-establish context from that state with your "
+    "own tools (your notes, todos, coverage, recorded findings, and the agent graph), "
+    "then continue from where the scan left off."
+)
+
 # Claude Code's own tools, kept as auxiliary research aids only.
 _NATIVE_TOOLS: tuple[str, ...] = ("Read", "Write", "WebSearch")
 # Platforms whose `claude` CLI can actually sandbox a bash command.
@@ -171,6 +195,50 @@ class ClaudeCodeRunResult:
 def _open_client(*, options: ClaudeAgentOptions) -> ClaudeSDKClient:
     """Seam for tests: patch this to avoid spawning a real ``claude`` process."""
     return ClaudeSDKClient(options=options)
+
+
+def _identity(text: str) -> str:
+    return text
+
+
+def _tool_name_rewriter(tools: Sequence[Tool]) -> Callable[[str], str]:
+    """Rewrite bare Strix tool names in outgoing text to their bridged form.
+
+    Strix's shared system prompt, its lifecycle nudge and its system mailbox
+    notices all name tools bare (``finish_scan``, ``respond_to_user``, ...).
+    That is correct for the default engine and wrong here, where a Strix tool
+    only exists as ``mcp__strix__<tool>`` and the bare name answers "No such
+    tool available". Rewriting on this engine's send path keeps the shared
+    prompt-building code -- used by both engines -- untouched.
+
+    ponytail: only names containing an underscore are rewritten. A single-word
+    tool name (``think``, ``notes``) is also an ordinary English word, and
+    prefixing every prose occurrence of it would corrupt the prompt; those stay
+    covered by ``_TOOL_NAMING_NOTE``'s blanket instruction.
+    """
+    names = sorted(
+        {name for tool in tools if "_" in (name := str(getattr(tool, "name", "") or ""))},
+        key=len,
+        reverse=True,
+    )
+    if not names:
+        return _identity
+    # No lookbehind needed: `mcp__strix__finish_scan` has no word boundary
+    # before `finish_scan`, so an already-prefixed name cannot match.
+    pattern = re.compile(rf"\b({'|'.join(re.escape(n) for n in names)})\b")
+    return lambda text: pattern.sub(lambda m: _MCP_TOOL_PREFIX + m.group(1), text)
+
+
+def _prompt_text(initial_input: Any) -> str:
+    """Whatever ``run_agent_loop`` was handed, as CLI prompt text.
+
+    A fresh run passes the task string; a spawned sub-agent passes
+    ``child_initial_input``'s ``[{"role": "user", "content": ...}]`` list; a
+    resume or respawn passes ``[]``.
+    """
+    if isinstance(initial_input, list | tuple):
+        return _pending_prompt(initial_input)
+    return str(initial_input or "").strip()
 
 
 def _wind_down_directive(is_root: bool, stage: int) -> str:
@@ -272,12 +340,17 @@ def _build_options(
     max_turns: int,
     agent_id: str,
     context: dict[str, Any],
+    lifecycle_output: dict[str, str] | None = None,
 ) -> ClaudeAgentOptions:
-    server = build_mcp_server(tools, context=context, name=_MCP_SERVER_NAME)
+    def _record(name: str, text: str) -> None:
+        if lifecycle_output is not None and name in _LIFECYCLE_FINISH_TOOLS:
+            lifecycle_output["last"] = text
+
+    server = build_mcp_server(tools, context=context, name=_MCP_SERVER_NAME, on_result=_record)
     native = _native_tools()
     scratch = _scratch_cwd(agent_id)
     return ClaudeAgentOptions(
-        system_prompt=instructions + _TOOL_NAMING_NOTE,
+        system_prompt=_tool_name_rewriter(tools)(instructions) + _TOOL_NAMING_NOTE,
         model=model_slug,
         mcp_servers={_MCP_SERVER_NAME: server},
         # Isolation: without these the CLI loads the operator's own
@@ -419,9 +492,7 @@ async def _apply_cost(
                 "pausing until the user continues"
             )
         await coordinator.set_status(agent_id, "stopped")
-        raise BudgetExceededError(
-            f"Token budget of ${ceiling:.2f} exceeded (spent ${total:.4f})"
-        )
+        raise BudgetExceededError(f"Token budget of ${ceiling:.2f} exceeded (spent ${total:.4f})")
     reserve_limit = ceiling * _SUBAGENT_BUDGET_RESERVE
     if not interactive and not is_root and total >= reserve_limit:
         await coordinator.set_status(agent_id, "stopped")
@@ -449,6 +520,10 @@ class _LoopConfig:
     max_budget_usd: float | None
     budget_hooks: Any = None
     event_sink: Callable[[str, Any], None] | None = None
+    # Last lifecycle tool result seen this turn, keyed "last" (N3), and the
+    # bare-tool-name rewrite applied to everything sent to the CLI (N4).
+    lifecycle_output: dict[str, str] = field(default_factory=dict)
+    rewrite: Callable[[str], str] = _identity
 
 
 async def _consume_response(
@@ -512,9 +587,7 @@ async def _run_until_lifecycle(
     nudged back into a tool call, bounded by the same recovery limit.
     """
     agent_id = cfg.agent_id
-    recovery_limit = (
-        _INTERACTIVE_TOOL_RECOVERY_LIMIT if cfg.interactive else max(1, cfg.max_turns)
-    )
+    recovery_limit = _INTERACTIVE_TOOL_RECOVERY_LIMIT if cfg.interactive else max(1, cfg.max_turns)
     result: ClaudeCodeRunResult | None = None
     text = prompt
 
@@ -523,12 +596,21 @@ async def _run_until_lifecycle(
             coordinator=coordinator, agent_id=agent_id, is_root=cfg.is_root
         )
         await coordinator.mark_running(agent_id)
-        await client.query(text)
+        # Single choke point for the bare-tool-name rewrite: the initial input,
+        # every nudge, and every mailbox-derived prompt goes through here.
+        await client.query(cfg.rewrite(text))
         turn = await _consume_response(
             client, coordinator=coordinator, cfg=cfg, turns_used=turns_used
         )
         turns_used = turn.turns_used
-        result = ClaudeCodeRunResult(final_output=turn.final_output)
+        # A lifecycle tool's JSON beats the CLI's closing prose: `strix.core.runner`
+        # parses `final_output` for `{"success": true, "scan_completed": true}` --
+        # the shape the default engine's `_finish_tool_use_behavior` forces -- and
+        # would otherwise log a false "ended without calling finish_scan" error on
+        # every successful claude-code scan.
+        result = ClaudeCodeRunResult(
+            final_output=cfg.lifecycle_output.pop("last", None) or turn.final_output
+        )
 
         status = await _agent_status(coordinator, agent_id)
         if status != "running":
@@ -614,12 +696,48 @@ async def _await_next_input(
     return _pending_prompt(items) or "Continue."
 
 
+async def _first_prompt(initial_input: Any, *, coordinator: AgentCoordinator, agent_id: str) -> str:
+    """The opening CLI prompt for whatever shape the runner handed this engine.
+
+    An empty input means a resume or a sub-agent respawn: the default engine
+    replays the agent's persisted SDK session there, which this engine cannot
+    do. Rather than opening the fresh CLI conversation with nothing, it is told
+    that it is resuming and given back its own registered task plus anything
+    already queued for it (``strix --resume --instruction ...`` lands there).
+    """
+    prompt = _prompt_text(initial_input)
+    if prompt:
+        return prompt
+
+    parts = [_RESUME_PROMPT]
+    metadata = getattr(coordinator, "metadata", {}) or {}
+    task = str((metadata.get(agent_id) or {}).get("task") or "").strip()
+    if task:
+        parts.append(f"Your assigned task:\n\n{task}")
+    _count, items = await coordinator.consume_pending(agent_id, include_items=True)
+    if queued := _pending_prompt(items):
+        parts.append(f"Messages queued while you were stopped:\n\n{queued}")
+    return "\n\n".join(parts)
+
+
+# Already-settled failures: each of these sets the agent's status (and notifies
+# its parent) before it unwinds, so the loop's own containment must not re-handle
+# them. Everything else that escapes is unexpected -- see the `except` below.
+_SETTLED_ERRORS = (
+    BudgetExceededError,
+    BudgetPausedError,
+    SubagentBudgetReservedError,
+    SubscriptionQuotaExceededError,
+    MaxTurnsExceeded,
+)
+
+
 async def run_claude_code_agent_loop(
     *,
     tools: Sequence[Tool],
     instructions: str,
     model_slug: str,
-    initial_input: str,
+    initial_input: Any,
     max_turns: int,
     max_budget_usd: float | None,
     context: dict[str, Any],
@@ -646,6 +764,7 @@ async def run_claude_code_agent_loop(
     if coordinator.reserve_stopped and start_parked and interactive and is_root:
         await coordinator.send(agent_id, _reserve_notice())
 
+    lifecycle_output: dict[str, str] = {}
     options = _build_options(
         tools=tools,
         instructions=instructions,
@@ -653,6 +772,7 @@ async def run_claude_code_agent_loop(
         max_turns=max_turns,
         agent_id=agent_id,
         context=context,
+        lifecycle_output=lifecycle_output,
     )
 
     cfg = _LoopConfig(
@@ -663,6 +783,8 @@ async def run_claude_code_agent_loop(
         max_budget_usd=max_budget_usd,
         budget_hooks=budget_hooks,
         event_sink=event_sink,
+        lifecycle_output=lifecycle_output,
+        rewrite=_tool_name_rewriter(tools),
     )
 
     result: ClaudeCodeRunResult | None = None
@@ -671,10 +793,13 @@ async def run_claude_code_agent_loop(
     try:
         async with client:
             if not (start_parked and interactive):
+                first_prompt = await _first_prompt(
+                    initial_input, coordinator=coordinator, agent_id=agent_id
+                )
                 with contextlib.suppress(BudgetPausedError):
                     result, turns_used = await _run_until_lifecycle(
                         client,
-                        prompt=initial_input,
+                        prompt=first_prompt,
                         coordinator=coordinator,
                         cfg=cfg,
                         turns_used=turns_used,
@@ -701,6 +826,26 @@ async def run_claude_code_agent_loop(
                         cfg=cfg,
                         turns_used=turns_used,
                     )
+    except _SETTLED_ERRORS:
+        raise
+    except Exception as exc:
+        # Anything else escaping the CLI session -- a transport failure,
+        # CLIConnectionError, ProcessError, a bug in a bridged tool -- would
+        # otherwise leave a sub-agent at "running" forever (its parent never
+        # told to stop waiting) and kill an interactive root's loop outright.
+        # Settled the way the default engine's `_run_cycle`/`_run_cycle_parked`
+        # settle their own uncaught errors.
+        status: Status = "failed" if interactive else "crashed"
+        logger.exception("Claude Code engine loop failed for %s; marking %s", agent_id, status)
+        with contextlib.suppress(Exception):
+            await coordinator.set_status(agent_id, status, error=str(exc) or type(exc).__name__)
+            await notify_parent_on_terminal(coordinator, agent_id, status)
+        if interactive:
+            # An interactive run stays resumable: `set_status("failed")` gates the
+            # agent on a user wake instead of tearing the whole scan down.
+            return result
+        raise
+    else:
         # Only reachable if the client's __aexit__ swallowed an exception.
         return result
     finally:
