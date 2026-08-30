@@ -521,7 +521,10 @@ class _LoopConfig:
     budget_hooks: Any = None
     event_sink: Callable[[str, Any], None] | None = None
     # Last lifecycle tool result seen this turn, keyed "last" (N3), and the
-    # bare-tool-name rewrite applied to everything sent to the CLI (N4).
+    # bare-tool-name rewrite (N4) -- applied only to text Strix itself
+    # generates to instruct the agent (the recovery nudge, the resume prompt,
+    # the reserve notice), never to the agent's task, target information or
+    # any user-supplied instruction/mailbox content.
     lifecycle_output: dict[str, str] = field(default_factory=dict)
     rewrite: Callable[[str], str] = _identity
 
@@ -596,9 +599,14 @@ async def _run_until_lifecycle(
             coordinator=coordinator, agent_id=agent_id, is_root=cfg.is_root
         )
         await coordinator.mark_running(agent_id)
-        # Single choke point for the bare-tool-name rewrite: the initial input,
-        # every nudge, and every mailbox-derived prompt goes through here.
-        await client.query(cfg.rewrite(text))
+        # `text` is already in its final form here: the only Strix-authored
+        # piece built inside this loop (the recovery nudge, below) is rewritten
+        # at the point it is constructed. The agent's actual task, target
+        # information and any user-supplied instruction/mailbox content --
+        # which may legitimately contain a bridged tool's name as a substring,
+        # e.g. inside a URL -- must reach the CLI byte-for-byte unmodified, so
+        # it is never passed through `cfg.rewrite`.
+        await client.query(text)
         turn = await _consume_response(
             client, coordinator=coordinator, cfg=cfg, turns_used=turns_used
         )
@@ -632,11 +640,15 @@ async def _run_until_lifecycle(
             )
             return settled if isinstance(settled, ClaudeCodeRunResult) else None, turns_used
 
-        text = tool_required_message(
-            finish_tool=_MCP_TOOL_PREFIX + ("finish_scan" if cfg.is_root else "agent_finish"),
-            attempt=recoveries,
-            limit=recovery_limit,
-            interactive=cfg.interactive,
+        # Strix-authored instructional text: rewritten here, at the point it is
+        # built, rather than deferred to a blanket rewrite at `client.query()`.
+        text = cfg.rewrite(
+            tool_required_message(
+                finish_tool=_MCP_TOOL_PREFIX + ("finish_scan" if cfg.is_root else "agent_finish"),
+                attempt=recoveries,
+                limit=recovery_limit,
+                interactive=cfg.interactive,
+            )
         )
 
 
@@ -696,7 +708,13 @@ async def _await_next_input(
     return _pending_prompt(items) or "Continue."
 
 
-async def _first_prompt(initial_input: Any, *, coordinator: AgentCoordinator, agent_id: str) -> str:
+async def _first_prompt(
+    initial_input: Any,
+    *,
+    coordinator: AgentCoordinator,
+    agent_id: str,
+    rewrite: Callable[[str], str],
+) -> str:
     """The opening CLI prompt for whatever shape the runner handed this engine.
 
     An empty input means a resume or a sub-agent respawn: the default engine
@@ -704,12 +722,17 @@ async def _first_prompt(initial_input: Any, *, coordinator: AgentCoordinator, ag
     do. Rather than opening the fresh CLI conversation with nothing, it is told
     that it is resuming and given back its own registered task plus anything
     already queued for it (``strix --resume --instruction ...`` lands there).
+
+    Only ``_RESUME_PROMPT`` -- Strix's own wording -- is rewritten. The
+    registered task and any queued messages are the agent's real task/target
+    description or user-supplied instructions and must reach the CLI verbatim,
+    even if one happens to contain a bridged tool's name as a substring.
     """
     prompt = _prompt_text(initial_input)
     if prompt:
         return prompt
 
-    parts = [_RESUME_PROMPT]
+    parts = [rewrite(_RESUME_PROMPT)]
     metadata = getattr(coordinator, "metadata", {}) or {}
     task = str((metadata.get(agent_id) or {}).get("task") or "").strip()
     if task:
@@ -761,8 +784,16 @@ async def run_claude_code_agent_loop(
     await coordinator.attach_runtime(agent_id, session=session, interrupt_on_message=interactive)
     await _check_already_stopped(coordinator=coordinator, agent_id=agent_id, is_root=is_root)
 
+    # Built once and reused below: for the reserve notice (Strix-authored,
+    # rewritten before it is queued) and for `cfg.rewrite` (the loop's own
+    # nudge). Never applied to the agent's task, target information or any
+    # user-supplied instruction/mailbox content -- see `_LoopConfig.rewrite`.
+    rewrite = _tool_name_rewriter(tools)
+
     if coordinator.reserve_stopped and start_parked and interactive and is_root:
-        await coordinator.send(agent_id, _reserve_notice())
+        notice = _reserve_notice()
+        notice["content"] = rewrite(str(notice.get("content", "")))
+        await coordinator.send(agent_id, notice)
 
     lifecycle_output: dict[str, str] = {}
     options = _build_options(
@@ -784,7 +815,7 @@ async def run_claude_code_agent_loop(
         budget_hooks=budget_hooks,
         event_sink=event_sink,
         lifecycle_output=lifecycle_output,
-        rewrite=_tool_name_rewriter(tools),
+        rewrite=rewrite,
     )
 
     result: ClaudeCodeRunResult | None = None
@@ -794,7 +825,7 @@ async def run_claude_code_agent_loop(
         async with client:
             if not (start_parked and interactive):
                 first_prompt = await _first_prompt(
-                    initial_input, coordinator=coordinator, agent_id=agent_id
+                    initial_input, coordinator=coordinator, agent_id=agent_id, rewrite=rewrite
                 )
                 with contextlib.suppress(BudgetPausedError):
                     result, turns_used = await _run_until_lifecycle(

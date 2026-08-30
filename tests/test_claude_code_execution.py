@@ -74,6 +74,18 @@ async def think(thought: str) -> str:
     return thought
 
 
+@function_tool
+async def list_reports() -> str:
+    """List findings filed so far."""
+    return "[]"
+
+
+@function_tool
+async def get_report(report_id: str) -> str:
+    """Get a single finding by id."""
+    return report_id
+
+
 _LIFECYCLE_TOOLS = [finish_scan, agent_finish, respond_to_user, wait_for_agents, think]
 
 
@@ -752,6 +764,43 @@ async def test_empty_resume_input_becomes_a_real_resume_prompt(
 
 
 @pytest.mark.asyncio
+async def test_resume_task_and_instruction_survive_rewrite_verbatim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The registered task and a queued ``--instruction`` can legitimately
+    contain a bridged tool's name as a substring (a target URL path, a plain
+    mention of an endpoint) and must reach the CLI unmodified, even though
+    this resumed root's opening prompt also carries Strix's own (rewritten)
+    resume wording right next to them."""
+    coordinator = _coordinator()
+    coordinator.metadata["agent-1"] = {
+        "task": "Pentest https://shop.example.com/api/v2/list_reports?id=1"
+    }
+    coordinator.mailbox.append(
+        {"from": "user", "content": "focus on the get_report endpoint this time"}
+    )
+    client = _FakeClient(
+        [_FakeResultMessage(is_error=False, result="ok", total_cost_usd=None)],
+        on_turn_end=_settles(coordinator),
+    )
+    _patch_client(monkeypatch, client)
+    _patch_report_state(monkeypatch, None)
+
+    await _run(
+        coordinator,
+        tools=[*_LIFECYCLE_TOOLS, list_reports, get_report],
+        initial_input=[],
+    )
+
+    prompt = client.prompts[0]
+    assert "https://shop.example.com/api/v2/list_reports?id=1" in prompt
+    assert "focus on the get_report endpoint this time" in prompt
+    # Strix's own resume wording is present and rewritten (it names no bridged
+    # tool here, so this just pins that the call site is actually exercised).
+    assert "resuming an interrupted Strix scan" in prompt
+
+
+@pytest.mark.asyncio
 async def test_subagent_message_list_input_is_unwrapped_not_repr_dumped(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -982,11 +1031,18 @@ def test_tool_name_rewriter_prefixes_known_bridged_names() -> None:
 
 
 @pytest.mark.asyncio
-async def test_every_prompt_sent_to_the_cli_uses_bridged_tool_names(
+async def test_only_the_lifecycle_nudge_is_rewritten_not_the_initial_task(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Covers all three send paths: the initial input, the lifecycle nudge (which
-    names respond_to_user / wait_for_agents), and a mailbox message."""
+    """The bare-tool-name rewrite must be scoped to Strix-authored text only.
+
+    It used to be applied as a blanket transform on every outgoing prompt at
+    ``client.query()``, which corrupted a root task/target description (or a
+    user ``--instruction``) that happened to contain a bridged tool's name as
+    a substring -- e.g. a real target URL ending in ``/list_reports``. The
+    lifecycle nudge (Strix's own wording) must still be rewritten so the CLI
+    can actually call the tool it names.
+    """
     coordinator = _coordinator()
 
     def _on_turn_end(turn: int) -> None:
@@ -1003,11 +1059,15 @@ async def test_every_prompt_sent_to_the_cli_uses_bridged_tool_names(
     # Interactive so the nudge is the interactive one, which is the wording that
     # names respond_to_user and wait_for_agents; that loop only ends when the
     # scan tears the agent down, so run it until it parks and then stop it.
+    target_task = (
+        "Start by calling think, then finish_scan when done. Target: "
+        "https://shop.example.com/api/v2/list_reports?id=1"
+    )
     task = asyncio.create_task(
         _run(
             coordinator,
-            tools=_LIFECYCLE_TOOLS,
-            initial_input="Start by calling think, then finish_scan when done.",
+            tools=[*_LIFECYCLE_TOOLS, list_reports],
+            initial_input=target_task,
             interactive=True,
         )
     )
@@ -1015,11 +1075,48 @@ async def test_every_prompt_sent_to_the_cli_uses_bridged_tool_names(
     task.cancel()
     await asyncio.gather(task, return_exceptions=True)
 
-    assert "mcp__strix__finish_scan" in client.prompts[0]
+    # The task/target text reaches the CLI byte-for-byte, bridged tool name
+    # substrings and all -- neither "finish_scan" nor "list_reports" (both
+    # real bridged tools in this agent's toolset) is touched.
+    assert client.prompts[0] == target_task
+    assert "mcp__strix__" not in client.prompts[0]
+
     nudge = client.prompts[1]
     for name in ("respond_to_user", "wait_for_agents", "finish_scan"):
         assert f"mcp__strix__{name}" in nudge
     assert "mcp__strix__mcp__strix__" not in nudge
+
+
+@pytest.mark.asyncio
+async def test_reserve_notice_is_rewritten_before_it_reaches_the_cli(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_reserve_notice()`` tells a parked root to call ``finish_scan`` bare.
+
+    Unlike the task/instruction content it travels alongside once queued (same
+    mailbox, same ``_pending_prompt`` render), this notice is Strix's own
+    wording, so it must reach the CLI bridged -- rewritten when it is sent,
+    not by rewriting whatever the mailbox later hands back (which would also
+    corrupt real user/agent messages queued next to it).
+    """
+    coordinator = _coordinator()
+    coordinator.reserve_stopped = True
+
+    client = _FakeClient(
+        [_FakeResultMessage(is_error=False, result="ok", total_cost_usd=None)],
+        on_turn_end=_settles(coordinator),
+    )
+    _patch_client(monkeypatch, client)
+    _patch_report_state(monkeypatch, None)
+
+    task = asyncio.create_task(
+        _run(coordinator, tools=_LIFECYCLE_TOOLS, interactive=True, start_parked=True)
+    )
+    await asyncio.sleep(0.05)
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+    assert "mcp__strix__finish_scan" in client.prompts[0]
 
     claude_code_execution._clear_scratch_cwd("agent-1")
 
