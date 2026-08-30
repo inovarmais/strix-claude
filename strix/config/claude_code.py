@@ -99,11 +99,13 @@ def _parse_reset_time(message: str) -> datetime | None:
     minute = int(match.group(2) or 0)
     if match.group(3).lower() == "pm":
         hour += 12
-    now = datetime.now(UTC)
-    candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-    if candidate <= now:
-        candidate += timedelta(days=1)
-    return candidate
+    now_local = datetime.now().astimezone()
+    candidate_local = now_local.replace(
+        hour=hour, minute=minute, second=0, microsecond=0
+    )
+    if candidate_local <= now_local:
+        candidate_local += timedelta(days=1)
+    return candidate_local.astimezone(UTC)
 
 
 def classify_quota_error(message: str) -> SubscriptionQuotaExceededError | None:

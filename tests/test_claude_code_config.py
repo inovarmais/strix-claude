@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import subprocess
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from unittest import mock
 
 import pytest
@@ -108,11 +108,24 @@ def test_classify_quota_error_returns_none_for_unrelated_text() -> None:
 
 
 def test_classify_quota_error_parses_explicit_clock_time() -> None:
-    err = claude_code.classify_quota_error("5-hour limit reached - resets 11:45pm")
-    assert err is not None
-    assert err.reset_at is not None
-    assert err.reset_at.hour == 23
-    assert err.reset_at.minute == 45
+    # Mock local time: 2024-01-15 20:00:00 UTC (for deterministic test)
+    # So 11:45pm (23:45 UTC) will be parsed and converted correctly
+    utc_tz = timezone(timedelta(hours=0))
+    local_time = datetime(2024, 1, 15, 20, 0, 0, tzinfo=utc_tz)
+
+    mock_now_result = mock.MagicMock()
+    mock_now_result.astimezone.return_value = local_time
+
+    with mock.patch("strix.config.claude_code.datetime") as mock_dt:
+        mock_dt.now.return_value = mock_now_result
+        mock_dt.UTC = UTC
+        mock_dt.timedelta = timedelta
+
+        err = claude_code.classify_quota_error("5-hour limit reached - resets 11:45pm")
+        assert err is not None
+        assert err.reset_at is not None
+        assert err.reset_at.hour == 23
+        assert err.reset_at.minute == 45
 
 
 def test_classify_quota_error_falls_back_when_time_unparseable() -> None:
@@ -121,3 +134,29 @@ def test_classify_quota_error_falls_back_when_time_unparseable() -> None:
     assert err is not None
     assert err.reset_at is not None
     assert err.reset_at >= before + claude_code._FALLBACK_QUOTA_WAIT - timedelta(seconds=5)
+
+
+def test_classify_quota_error_converts_local_time_to_utc() -> None:
+    # Mock local time: 2024-01-15 14:00:00 EST (UTC-5)
+    # This should convert to 2024-01-15 19:00:00 UTC
+    est = timezone(timedelta(hours=-5))
+    local_time = datetime(2024, 1, 15, 14, 0, 0, tzinfo=est)
+
+    # Create a mock that returns our local time when astimezone() is called
+    mock_now_result = mock.MagicMock()
+    mock_now_result.astimezone.return_value = local_time
+
+    with mock.patch("strix.config.claude_code.datetime") as mock_dt:
+        # Make datetime.now() return our mock result
+        mock_dt.now.return_value = mock_now_result
+        # Preserve UTC and timedelta for use in the function
+        mock_dt.UTC = UTC
+        mock_dt.timedelta = timedelta
+
+        err = claude_code.classify_quota_error("5-hour limit reached - resets 2pm")
+        assert err is not None
+        assert err.reset_at is not None
+        # 2pm EST (UTC-5) should convert to 7pm UTC
+        assert err.reset_at.hour == 19
+        assert err.reset_at.minute == 0
+        assert err.reset_at.tzinfo == UTC
