@@ -1,8 +1,8 @@
 <div align="center">
 
-# Inovar +AZ
+# inovar-strix
 
-### AI-powered penetration testing, powered by [Strix.ai](https://strix.ai)
+### Inovar +AZ's AI-powered penetration testing tool, powered by [Strix.ai](https://strix.ai)
 
 Autonomous AI hackers that find and exploit your applications' vulnerabilities - running your code dynamically and validating every finding with a real, working proof-of-concept, not a static-analysis guess.
 
@@ -20,7 +20,7 @@ Autonomous AI hackers that find and exploit your applications' vulnerabilities -
 
 ## Overview
 
-Inovar +AZ is our internal build of [Strix](https://strix.ai), an open-source autonomous AI pentesting framework. The agents act like real hackers - they run your code dynamically, find vulnerabilities, and validate them through actual proofs-of-concept - so findings come with a working exploit, not a false-positive-prone static-analysis alert.
+**inovar-strix** is Inovar +AZ's internal build of [Strix](https://strix.ai), an open-source autonomous AI pentesting framework. The agents act like real hackers - they run your code dynamically, find vulnerabilities, and validate them through actual proofs-of-concept - so findings come with a working exploit, not a false-positive-prone static-analysis alert.
 
 **Key Capabilities:**
 
@@ -223,7 +223,7 @@ strix -n --target https://your-app.com
 Add a security test on pull requests with a lightweight GitHub Actions workflow:
 
 ```yaml
-name: inovar-az-penetration-test
+name: inovar-strix-penetration-test
 
 on:
   pull_request:
@@ -328,11 +328,11 @@ See the [LLM Providers documentation](https://docs.strix.ai/llm-providers/overvi
 
 ## Documentation
 
-Since Inovar +AZ is a build on top of the open-source engine, the upstream documentation at **[docs.strix.ai](https://docs.strix.ai)** covers usage, CI/CD integrations, skills, and advanced configuration for everything except the Claude Code engine addition documented above.
+Since inovar-strix is a build on top of the open-source engine, the upstream documentation at **[docs.strix.ai](https://docs.strix.ai)** covers usage, CI/CD integrations, skills, and advanced configuration for everything except the Claude Code engine addition documented above.
 
 ## Acknowledgements
 
-Inovar +AZ is powered by [**Strix**](https://strix.ai), the open-source autonomous AI penetration testing framework - all credit for the core agent engine, sandboxed toolset, and multi-agent orchestration goes to the Strix team and its contributors. Strix itself builds on the work of open-source projects like [LiteLLM](https://github.com/BerriAI/litellm), [Caido](https://github.com/caido/caido), [Nuclei](https://github.com/projectdiscovery/nuclei), [Playwright](https://github.com/microsoft/playwright), and [Bubble Tea](https://github.com/charmbracelet/bubbletea).
+inovar-strix, built by Inovar +AZ, is powered by [**Strix**](https://strix.ai), the open-source autonomous AI penetration testing framework - all credit for the core agent engine, sandboxed toolset, and multi-agent orchestration goes to the Strix team and its contributors. Strix itself builds on the work of open-source projects like [LiteLLM](https://github.com/BerriAI/litellm), [Caido](https://github.com/caido/caido), [Nuclei](https://github.com/projectdiscovery/nuclei), [Playwright](https://github.com/microsoft/playwright), and [Bubble Tea](https://github.com/charmbracelet/bubbletea).
 
 > [!WARNING]
 > **Authorized use only.** This tool actively tests the targets you point it at, so only run it against systems you own or have **explicit, written permission** to test, and stay within the agreed scope. Unauthorized testing is illegal in most jurisdictions.
