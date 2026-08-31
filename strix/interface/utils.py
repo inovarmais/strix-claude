@@ -1715,8 +1715,8 @@ def validate_config_file(config_path: str) -> Path:
 
 def _workspace_file_dest(spec: str, source: Path) -> str:
     """Return the workspace-relative destination declared by ``spec``."""
-    _, sep, dest = spec.rpartition(":")
-    candidate = dest.strip() if sep and dest.strip() else source.name
+    _, dest = _split_workspace_spec(spec)
+    candidate = dest if dest else source.name
     if candidate.startswith("/") or Path(candidate).is_absolute():
         if not candidate.startswith("/workspace/"):
             raise ValueError(
@@ -1736,6 +1736,20 @@ def _workspace_file_dest(spec: str, source: Path) -> str:
     return candidate
 
 
+def _split_workspace_spec(spec: str) -> tuple[str, str | None]:
+    """Split a ``PATH[:DEST]`` spec into its source path and optional dest.
+
+    A bare Windows path (``C:\\...``) has exactly one colon, right after a
+    single drive letter -- that's not a ``PATH:DEST`` separator, it's part of
+    the path itself, so it must not be peeled off as a destination override.
+    """
+    raw, sep, dest = spec.rpartition(":")
+    is_drive_letter = bool(sep) and len(raw) == 1 and raw.isalpha()
+    if sep and dest.strip() and not is_drive_letter:
+        return raw, dest.strip()
+    return spec, None
+
+
 def resolve_workspace_files(specs: list[str] | None) -> list[dict[str, str]]:
     """Validate ``PATH[:DEST]`` specs into source/destination pairs.
 
@@ -1746,8 +1760,7 @@ def resolve_workspace_files(specs: list[str] | None) -> list[dict[str, str]]:
     resolved: list[dict[str, str]] = []
     seen: dict[str, str] = {}
     for spec in specs or []:
-        raw, sep, dest = spec.rpartition(":")
-        source_text = raw if sep and dest.strip() else spec
+        source_text, _dest = _split_workspace_spec(spec)
         source = Path(source_text.strip()).expanduser()
         if not source.is_file():
             raise ValueError(f"'{source}' is not an existing file")

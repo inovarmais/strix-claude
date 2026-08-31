@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import stat
+import sys
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
@@ -86,6 +87,10 @@ def test_is_verified_accepts_epoch_expiry() -> None:
     assert auth.is_verified() is True
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="Windows has no POSIX permission bits; os.open's mode is not honored there",
+)
 def test_write_auth_is_0600() -> None:
     auth.write_auth(email="a@b.com", token="t", verified_at="")  # nosec B106
     mode = stat.S_IMODE(auth.AUTH_PATH.stat().st_mode)

@@ -177,8 +177,11 @@ def test_check_mountable_dir_accepts_a_project_under_the_home_root(
 
 
 def test_infer_target_type_applies_the_mount_policy() -> None:
+    system_subdir = next((p for p in (Path("/etc/ssl"), Path("/usr/bin")) if p.is_dir()), None)
+    if system_subdir is None:
+        pytest.skip("no system subdirectory on this platform")
     with pytest.raises(ValueError, match="Refusing to mount"):
-        infer_target_type("/etc")
+        infer_target_type(str(system_subdir.parent))
 
 
 def test_read_target_list_file_strips_blank_lines(tmp_path: Path) -> None:

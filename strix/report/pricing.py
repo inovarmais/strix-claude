@@ -6,6 +6,19 @@ from functools import lru_cache
 from typing import Any, cast
 
 
+def _pick_ambiguous_match(
+    matches: list[str], prices: set[tuple[Any, Any]], name: str
+) -> str | None:
+    """Disambiguate multiple provider-prefixed matches for one bare model name."""
+    if len(matches) == 1 or len(prices) == 1:
+        return matches[0]
+    # Multiple third-party resellers price this model differently -- prefer
+    # the provider whose own name the model is published under (e.g.
+    # "minimax/MiniMax-M3") over unrelated rehosts.
+    canonical = [key for key in matches if name.lower().startswith(key.split("/", 1)[0].lower())]
+    return canonical[0] if len(canonical) == 1 else None
+
+
 @lru_cache(maxsize=512)
 def resolve_litellm_model(model: str) -> str | None:
     """Return a provider-qualified model name that LiteLLM can price."""
@@ -47,8 +60,9 @@ def resolve_litellm_model(model: str) -> str | None:
                 for key in matches
                 if isinstance(model_cost.get(key), dict)
             }
-            if len(matches) == 1 or len(prices) == 1:
-                return matches[0]
+            picked = _pick_ambiguous_match(matches, prices, name)
+            if picked is not None:
+                return picked
         return None  # noqa: TRY300
     except Exception:  # noqa: BLE001
         return None
