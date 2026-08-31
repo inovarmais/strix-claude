@@ -14,7 +14,7 @@ import logging
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
-from strix.config import Settings, codex, load_settings
+from strix.config import Settings, claude_code, codex, load_settings
 from strix.core.paths import run_dir_for
 from strix.interface.utils import (
     assign_workspace_subdirs,
@@ -63,7 +63,17 @@ async def preflight_model_connection(
     *,
     settings: Settings | None = None,
 ) -> None:
-    """Verify the configured model route before starting a scan."""
+    """Verify the configured model route before starting a scan.
+
+    A ``claude-code/<model>`` route never touches the Agents-SDK/litellm model
+    interface this preflight pings -- it drives the real ``claude`` CLI
+    instead (``strix.core.claude_code_execution``). That CLI's own login is
+    already checked in ``validate_environment()``, so there is nothing left
+    to warm up here.
+    """
+    if claude_code.engine_model(model_name):
+        return
+
     from agents.models.interface import ModelTracing
 
     from strix.config.models import StrixProvider, configure_sdk_model_defaults

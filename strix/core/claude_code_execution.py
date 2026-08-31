@@ -135,6 +135,7 @@ if TYPE_CHECKING:
 
     from agents.memory import Session
     from agents.tool import Tool
+    from claude_agent_sdk.types import SystemPromptFile
 
     from strix.core.agents import AgentCoordinator, Status
 
@@ -263,6 +264,18 @@ def _scratch_cwd(agent_id: str) -> Path:
     return path
 
 
+def _write_system_prompt_file(scratch: Path, system_prompt: str) -> SystemPromptFile:
+    """Persist ``system_prompt`` under ``scratch`` and point the CLI at it.
+
+    See ``_build_options``: this is how the prompt reaches the CLI without
+    going through argv, which has an OS-enforced length limit this prompt
+    exceeds.
+    """
+    path = scratch / ".system_prompt.txt"
+    path.write_text(system_prompt, encoding="utf-8")
+    return {"type": "file", "path": str(path)}
+
+
 def _clear_scratch_cwd(agent_id: str) -> None:
     """Drop the agent's native-tool scratch directory when its session ends."""
     shutil.rmtree(Path(gettempdir()) / _SCRATCH_DIR_NAME / agent_id, ignore_errors=True)
@@ -349,8 +362,15 @@ def _build_options(
     server = build_mcp_server(tools, context=context, name=_MCP_SERVER_NAME, on_result=_record)
     native = _native_tools()
     scratch = _scratch_cwd(agent_id)
+    system_prompt = _tool_name_rewriter(tools)(instructions) + _TOOL_NAMING_NOTE
     return ClaudeAgentOptions(
-        system_prompt=_tool_name_rewriter(tools)(instructions) + _TOOL_NAMING_NOTE,
+        # Strix's rendered prompt is well past Windows' ~32K CreateProcess
+        # command-line limit on its own (observed ~125KB); passed inline as
+        # `--system-prompt <text>` it failed every launch there with
+        # `WinError 206: filename or extension is too long`. A file sidesteps
+        # any OS argv limit -- ``--system-prompt-file`` is the CLI's own
+        # supported alternative for exactly this case.
+        system_prompt=_write_system_prompt_file(scratch, system_prompt),
         model=model_slug,
         mcp_servers={_MCP_SERVER_NAME: server},
         # Isolation: without these the CLI loads the operator's own

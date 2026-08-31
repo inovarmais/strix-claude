@@ -609,9 +609,15 @@ def test_options_sandbox_native_tools_and_path_guard() -> None:
     # no MCP servers other than Strix's own in-process one.
     assert options.setting_sources == []
     assert options.strict_mcp_config is True
+    # The prompt is written to a file, not passed inline: Strix's rendered
+    # prompt is well past Windows' ~32K CreateProcess argv limit on its own.
+    assert options.system_prompt is not None
+    assert isinstance(options.system_prompt, dict)
+    assert options.system_prompt["type"] == "file"
+    prompt_text = Path(options.system_prompt["path"]).read_text(encoding="utf-8")
     # Strix's prompt names tools bare; the bridge exposes them prefixed.
-    assert "mcp__strix__finish_scan" in str(options.system_prompt)
-    assert "be careful" in str(options.system_prompt)
+    assert "mcp__strix__finish_scan" in prompt_text
+    assert "be careful" in prompt_text
 
     claude_code_execution._clear_scratch_cwd("agent-opts")
 
@@ -1132,7 +1138,9 @@ def test_shared_system_prompt_is_rewritten_only_on_the_claude_code_engine() -> N
         agent_id="agent-sysprompt",
         context={"parent_id": None},
     )
-    assert "call mcp__strix__finish_scan." in str(options.system_prompt)
+    assert isinstance(options.system_prompt, dict)
+    prompt_text = Path(options.system_prompt["path"]).read_text(encoding="utf-8")
+    assert "call mcp__strix__finish_scan." in prompt_text
 
     # The default engine's own nudge builder is untouched: bare names are
     # correct there and prefixing them would break it.

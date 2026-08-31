@@ -13,7 +13,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
 
-from strix.config import codex, load_settings, persist_current
+from strix.config import claude_code, codex, load_settings, persist_current
 from strix.core.paths import run_dir_for
 from strix.interface.cli_args import parse_arguments
 from strix.interface.environment import (
@@ -404,10 +404,21 @@ def _bootstrap_scan(args: argparse.Namespace) -> None:
     telemetry_start(args)
 
 
+def _needs_win32_selector_event_loop() -> bool:
+    """Whether to force Windows' selector event loop policy.
+
+    The Claude Code engine spawns the `claude` CLI as a subprocess
+    (claude-agent-sdk); Windows' selector event loop can't create
+    subprocesses at all (``NotImplementedError``), only the default proactor
+    loop can -- so that engine must keep the default.
+    """
+    return sys.platform == "win32" and not claude_code.engine_model(load_settings().llm.model)
+
+
 def main() -> None:
     configure_dependency_logging()
 
-    if sys.platform == "win32":
+    if _needs_win32_selector_event_loop():
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
     # `strix view [<run>]` is a viewer-only subcommand, dispatched before the
