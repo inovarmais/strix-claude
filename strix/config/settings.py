@@ -133,6 +133,17 @@ class IntegrationSettings(BaseSettings):
         alias="POSTMAN_API_KEY",
         repr=False,
     )
+    # Optional: push a completed scan's findings to a SmartDesk instance's
+    # vulnerability-management module. Both unset -> the upload is skipped.
+    smartdesk_base_url: str | None = Field(
+        default=None,
+        alias="SMARTDESK_BASE_URL",
+    )
+    smartdesk_api_key: str | None = Field(
+        default=None,
+        alias="SMARTDESK_API_KEY",
+        repr=False,
+    )
 
 
 class ViewerSettings(BaseSettings):

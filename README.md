@@ -262,6 +262,8 @@ export LLM_API_KEY="your-api-key"
 export LLM_API_BASE="your-api-base-url"  # if using a local model, e.g. Ollama, LMStudio
 export PERPLEXITY_API_KEY="your-api-key"  # for search capabilities
 export STRIX_REASONING_EFFORT="high"  # control thinking effort (default: high, quick scan: medium)
+export SMARTDESK_BASE_URL="https://desk.inovar-mais.pt"  # push findings to SmartDesk when a scan ends
+export SMARTDESK_API_KEY="your-smartdesk-api-key"
 ```
 
 > [!NOTE]

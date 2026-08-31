@@ -16,6 +16,7 @@ from strix.core.paths import run_dir_for, runtime_state_dir
 from strix.report.coverage import write_coverage
 from strix.report.pricing import resolve_litellm_model
 from strix.report.sarif import write_sarif
+from strix.report.smartdesk import upload_to_smartdesk
 from strix.report.writer import (
     read_run_record,
     write_executive_report,
@@ -495,6 +496,20 @@ class ReportState:
 
         self._sync_llm_usage_record()
         self._save_artifacts()
+
+        # Only on the run's final save -- not after every single finding,
+        # which would re-upload the growing list on each
+        # create_vulnerability_report call.
+        if mark_complete or status:
+            try:
+                upload_to_smartdesk(
+                    self.get_run_dir(),
+                    self.run_name or self.run_id,
+                    self.vulnerability_reports,
+                    self.run_record,
+                )
+            except Exception:
+                logger.exception("SmartDesk upload step failed (non-fatal)")
 
     def cleanup(self, status: str = "stopped") -> None:
         self.save_run_data(status=status)
